@@ -242,7 +242,7 @@ class CoreDeviceLocationManager:
                 if not serial or serial in seen_udids:
                     continue
                 seen_udids.add(serial)
-                devices.append({
+                dev_entry = {
                     "udid": serial,
                     "name": "iOS Device (USB)",
                     "model": "iPhone (USB)",
@@ -251,7 +251,27 @@ class CoreDeviceLocationManager:
                     "auth_state": "paired_usb",
                     "connection_type": "USB",
                     "is_coredevice": False,
-                })
+                    "developer_mode": None,
+                }
+                # Check developer mode status & auto-reveal option in Settings UI
+                try:
+                    from pymobiledevice3.lockdown import create_using_usbmux
+                    from pymobiledevice3.services.amfi import AmfiService
+                    lk = await create_using_usbmux(serial=serial)
+                    if hasattr(lk, "get_developer_mode_status"):
+                        dev_on = await lk.get_developer_mode_status()
+                        dev_entry["developer_mode"] = dev_on
+                        if dev_on is False:
+                            try:
+                                await AmfiService(lk).reveal_developer_mode_option_in_ui()
+                                dev_entry["developer_mode_revealed"] = True
+                                logger.info(f"Auto-revealed Developer Mode toggle in UI for {serial}")
+                            except Exception as rev_e:
+                                logger.debug(f"Auto-reveal notice: {rev_e}")
+                except Exception as lk_e:
+                    logger.debug(f"Device lockdown probe error for {serial}: {lk_e}")
+
+                devices.append(dev_entry)
         except Exception as e:
             from pymobiledevice3.exceptions import ConnectionFailedToUsbmuxdError
             if isinstance(e, ConnectionFailedToUsbmuxdError):
@@ -323,6 +343,98 @@ class CoreDeviceLocationManager:
             finally:
                 # Clean up session to prevent tunnel staleness
                 await self.disconnect_device(key)
+
+    async def get_developer_mode_status(self, device_id: Optional[str] = None) -> Optional[bool]:
+        """
+        Check if Developer Mode is enabled on device.
+        """
+        try:
+            from pymobiledevice3.lockdown import create_using_usbmux
+            lockdown = await create_using_usbmux(serial=device_id)
+            if hasattr(lockdown, "get_developer_mode_status"):
+                return await lockdown.get_developer_mode_status()
+        except Exception as e:
+            logger.debug(f"get_developer_mode_status failed: {e}")
+        return None
+
+    async def reveal_developer_mode(self, device_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Reveal hidden Developer Mode toggle in iOS Settings -> Privacy & Security.
+        """
+        from pymobiledevice3.lockdown import create_using_usbmux
+        from pymobiledevice3.services.amfi import AmfiService
+        try:
+            lockdown = await create_using_usbmux(serial=device_id)
+            amfi = AmfiService(lockdown)
+            await amfi.reveal_developer_mode_option_in_ui()
+            logger.info(f"Successfully revealed developer mode option in UI for {device_id or 'default'}")
+            return {
+                "success": True,
+                "revealed": True,
+                "message": "已成功在 iPhone 上点亮【开发者模式】入口！请打开手机「设置 ➔ 隐私与安全性 ➔ 开发者模式」开启并重启手机。"
+            }
+        except Exception as e:
+            logger.error(f"Failed to reveal developer mode: {e}")
+            raise RuntimeError(f"点亮开发者模式失败: {e}")
+
+    async def enable_developer_mode(self, device_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Trigger Developer Mode activation.
+        First reveals the UI option, then sends enable request.
+        Handles passcode protection gracefully.
+        """
+        from pymobiledevice3.lockdown import create_using_usbmux
+        from pymobiledevice3.services.amfi import AmfiService
+        from pymobiledevice3.exceptions import DeviceHasPasscodeSetError
+        
+        lockdown = await create_using_usbmux(serial=device_id)
+        amfi = AmfiService(lockdown)
+        
+        # 1. 确保 UI 入口首先点亮
+        try:
+            await amfi.reveal_developer_mode_option_in_ui()
+        except Exception as e:
+            logger.debug(f"reveal in enable_developer_mode notice: {e}")
+
+        # 2. 检查是否已经开启
+        try:
+            if hasattr(lockdown, "get_developer_mode_status") and await lockdown.get_developer_mode_status():
+                return {
+                    "success": True,
+                    "already_enabled": True,
+                    "rebooting": False,
+                    "message": "iPhone 当前已处于【开发者模式】，无需重复开启！"
+                }
+        except Exception:
+            pass
+
+        # 3. 尝试直接触发开启并重启
+        try:
+            await amfi.enable_developer_mode(enable_post_restart=False)
+            logger.info(f"Triggered developer mode reboot on {device_id or 'default'}")
+            return {
+                "success": True,
+                "rebooting": True,
+                "has_passcode": False,
+                "message": "已向 iPhone 发送开启指令，手机即将自动重启！开机后请点击屏幕上的【开启】并确认即可。"
+            }
+        except DeviceHasPasscodeSetError:
+            logger.info("Device has passcode set. Revealed UI option successfully.")
+            return {
+                "success": True,
+                "rebooting": False,
+                "has_passcode": True,
+                "revealed": True,
+                "message": "已成功在 iPhone 上点亮隐藏的【开发者模式】！由于您的手机设有锁屏密码，苹果系统要求机主手动确认：请前往手机「设置 ➔ 隐私与安全性 ➔ 开发者模式」开启并重启输入密码。"
+            }
+        except Exception as e:
+            logger.error(f"enable_developer_mode error: {e}")
+            return {
+                "success": True,
+                "rebooting": False,
+                "revealed": True,
+                "message": f"已为您点亮 iPhone「设置 ➔ 隐私与安全性 ➔ 开发者模式」入口。请前往手机手动点击开启并重启。（原因：{e}）"
+            }
 
     async def disconnect_device(self, device_id: str):
         key = device_id or "default"

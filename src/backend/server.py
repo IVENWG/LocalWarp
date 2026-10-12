@@ -39,7 +39,7 @@ except ImportError:
     # Support bundled binary execution
     from src.poc.coredevice_location_poc import CoreDeviceLocationManager
 
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("LocalWarpConnector")
@@ -132,6 +132,30 @@ async def clear_location(req: ClearLocationRequest):
         }
     except Exception as e:
         logger.error(f"Failed to clear location: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/device/{udid}/reveal_developer_mode")
+@app.post("/api/device/reveal_developer_mode")
+async def reveal_developer_mode(udid: Optional[str] = None):
+    try:
+        logger.info(f"Received request to reveal developer mode for udid={udid}")
+        res = await manager.reveal_developer_mode(device_id=udid)
+        return res
+    except Exception as e:
+        logger.error(f"Failed to reveal developer mode: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/device/{udid}/enable_developer_mode")
+@app.post("/api/device/enable_developer_mode")
+async def enable_developer_mode(udid: Optional[str] = None):
+    try:
+        logger.info(f"Received request to enable developer mode for udid={udid}")
+        res = await manager.enable_developer_mode(device_id=udid)
+        return res
+    except Exception as e:
+        logger.error(f"Failed to enable developer mode: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
