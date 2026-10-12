@@ -51,32 +51,108 @@ class CoreDeviceLocationClient:
     async def set_simulated_location(self, latitude: float, longitude: float) -> Dict[str, Any]:
         """
         Set simulated location with {latitude: double, longitude: double} flat payload.
+        Supports CoreDevice LocationService with automatic fallback to DtSimulateLocation and auto_mount.
         """
+        # 1. Check Developer Mode status first
+        if hasattr(self.rsd, "get_developer_mode_status") and getattr(self.rsd, "has_developer_mode", False):
+            try:
+                is_dev = await self.rsd.get_developer_mode_status()
+                if not is_dev:
+                    raise RuntimeError("您的 iPhone 尚未开启【开发者模式】。请在手机「设置 ➔ 隐私与安全性 ➔ 开发者模式」中开启并重启手机。")
+            except Exception as e:
+                if "尚未开启" in str(e):
+                    raise
+                logger.warning(f"Developer mode check error: {e}")
+
         payload = {
             "latitude": float(latitude),
             "longitude": float(longitude)
         }
-        await self.service.connect()
-        logger.info(f"Invoking {self.ACTION_SET} with payload: {payload}")
-        result = await self.service.invoke(
-            feature_identifier=self.FEATURE_LOCATION,
-            input_=payload,
-            action_identifier=self.ACTION_SET
-        )
-        return result
+
+        # 2. Preferred: CoreDevice LocationService (iOS 17+ native tunnel)
+        try:
+            await self.service.connect()
+            logger.info(f"Invoking {self.ACTION_SET} with payload: {payload}")
+            result = await self.service.invoke(
+                feature_identifier=self.FEATURE_LOCATION,
+                input_=payload,
+                action_identifier=self.ACTION_SET
+            )
+            return result
+        except Exception as e:
+            logger.warning(f"CoreDevice locationservice invocation failed: {e}. Trying fallback to DtSimulateLocation...")
+
+            # 3. Fallback: DtSimulateLocation (DVT Developer service)
+            try:
+                from pymobiledevice3.services.simulate_location import DtSimulateLocation
+                dt_loc = DtSimulateLocation(self.rsd)
+                await dt_loc.set(latitude, longitude)
+                logger.info("Successfully set location via fallback DtSimulateLocation!")
+                return {"status": "ok", "service": "com.apple.dt.simulatelocation"}
+            except Exception as dt_e:
+                logger.warning(f"DtSimulateLocation fallback failed: {dt_e}")
+
+            # 4. Fallback: auto_mount DDI and retry CoreDevice
+            try:
+                from pymobiledevice3.services.mobile_image_mounter import auto_mount
+                logger.info("Attempting auto_mount developer disk image...")
+                await auto_mount(self.rsd)
+                await self.service.connect()
+                return await self.service.invoke(
+                    feature_identifier=self.FEATURE_LOCATION,
+                    input_=payload,
+                    action_identifier=self.ACTION_SET
+                )
+            except Exception as mount_e:
+                logger.warning(f"auto_mount attempt failed: {mount_e}")
+
+            # 5. Clear diagnostic error
+            raise RuntimeError(
+                "无法激活定位服务 (No such service: com.apple.coredevice.locationservice)。"
+                "这通常是因为 iPhone 尚未开启【开发者模式】。请前往手机「设置 ➔ 隐私与安全性 ➔ 开发者模式」开启并重启手机确认。"
+            )
 
     async def clear_simulated_location(self) -> Dict[str, Any]:
         """
         Clear simulated location with empty dictionary payload.
+        Supports CoreDevice LocationService with automatic fallback to DtSimulateLocation.
         """
-        await self.service.connect()
-        logger.info(f"Invoking {self.ACTION_CLEAR} with empty payload")
-        result = await self.service.invoke(
-            feature_identifier=self.FEATURE_LOCATION,
-            input_={},
-            action_identifier=self.ACTION_CLEAR
-        )
-        return result
+        # 1. Check Developer Mode status first
+        if hasattr(self.rsd, "get_developer_mode_status") and getattr(self.rsd, "has_developer_mode", False):
+            try:
+                is_dev = await self.rsd.get_developer_mode_status()
+                if not is_dev:
+                    raise RuntimeError("您的 iPhone 尚未开启【开发者模式】。请在手机「设置 ➔ 隐私与安全性 ➔ 开发者模式」中开启并重启手机。")
+            except Exception as e:
+                if "尚未开启" in str(e):
+                    raise
+                logger.warning(f"Developer mode check error: {e}")
+
+        # 2. Preferred: CoreDevice LocationService
+        try:
+            await self.service.connect()
+            logger.info(f"Invoking {self.ACTION_CLEAR} with empty payload")
+            result = await self.service.invoke(
+                feature_identifier=self.FEATURE_LOCATION,
+                input_={},
+                action_identifier=self.ACTION_CLEAR
+            )
+            return result
+        except Exception as e:
+            logger.warning(f"CoreDevice clear location failed: {e}. Trying fallback to DtSimulateLocation...")
+            try:
+                from pymobiledevice3.services.simulate_location import DtSimulateLocation
+                dt_loc = DtSimulateLocation(self.rsd)
+                await dt_loc.clear()
+                logger.info("Successfully cleared location via fallback DtSimulateLocation!")
+                return {"status": "ok", "service": "com.apple.dt.simulatelocation"}
+            except Exception as dt_e:
+                logger.warning(f"DtSimulateLocation clear failed: {dt_e}")
+
+            raise RuntimeError(
+                "无法恢复真实定位。这通常是因为 iPhone 尚未开启【开发者模式】。"
+                "请前往手机「设置 ➔ 隐私与安全性 ➔ 开发者模式」开启并重启手机确认。"
+            )
 
 
 IOS_MODEL_MAP = {
