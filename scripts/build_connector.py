@@ -89,7 +89,7 @@ def build():
         "--hidden-import=zeroconf",
         "--hidden-import=pydantic",
         BACKEND_MAIN
-    ]
+    ])
     
     print("[*] Running command:")
     print(" ".join(cmd))
