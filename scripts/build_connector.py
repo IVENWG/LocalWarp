@@ -71,13 +71,8 @@ def build():
         "--collect-all=construct",
         "--collect-all=zeroconf",
         "--collect-all=pytun_pmd3",
-        "--collect-all=pyimg4",
-        "--collect-all=readchar",
         "--copy-metadata=pytun_pmd3",
         "--copy-metadata=pymobiledevice3",
-        "--copy-metadata=pyimg4",
-        "--copy-metadata=readchar",
-        "--copy-metadata=apple_compress",
         # Hidden imports for uvicorn & async engines
         "--hidden-import=uvicorn.logging",
         "--hidden-import=uvicorn.loops",
@@ -97,12 +92,21 @@ def build():
         "--hidden-import=zeroconf",
         "--hidden-import=pydantic",
         "--hidden-import=pytun_pmd3",
-        "--hidden-import=pyimg4",
-        "--hidden-import=readchar",
         "--hidden-import=ipsw_parser",
-        "--hidden-import=apple_compress",
         BACKEND_MAIN
     ])
+
+    # Dynamic safe metadata injection for DDI / Cryptex tools
+    import importlib.metadata
+    for opt_pkg in ["pyimg4", "readchar", "apple_compress"]:
+        try:
+            importlib.metadata.distribution(opt_pkg)
+            cmd.insert(-1, f"--copy-metadata={opt_pkg}")
+            cmd.insert(-1, f"--collect-all={opt_pkg}")
+            cmd.insert(-1, f"--hidden-import={opt_pkg}")
+            print(f"[+] Found {opt_pkg}, bundled metadata and imports successfully.")
+        except Exception:
+            print(f"[*] Package {opt_pkg} not present, skipping metadata.")
 
     # Explicitly include pytun_pmd3 package directory and wintun.dll binaries
     try:

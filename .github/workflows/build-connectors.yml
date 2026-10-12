@@ -36,7 +36,7 @@ jobs:
       - name: Install Build Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller uvicorn fastapi pydantic requests construct zeroconf pymobiledevice3 pytun-pmd3
+          pip install pyinstaller uvicorn fastapi pydantic requests construct zeroconf pymobiledevice3 pytun-pmd3 pyimg4
         shell: bash
 
       - name: Compile Standalone Binary via PyInstaller
