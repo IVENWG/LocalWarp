@@ -1,0 +1,77 @@
+name: Build Standalone Connectors for 3 Platforms
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-binaries:
+    name: Build (${{ matrix.os }} - ${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            arch: x64
+            artifact_name: LocalWarp-Connector-windows-x64.exe
+          - os: macos-latest
+            arch: arm64
+            artifact_name: LocalWarp-Connector-macos-arm64
+          - os: ubuntu-latest
+            arch: x64
+            artifact_name: LocalWarp-Connector-linux-x64
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Build Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller uvicorn fastapi pydantic requests construct zeroconf pymobiledevice3
+        shell: bash
+
+      - name: Compile Standalone Binary via PyInstaller
+        run: |
+          python scripts/build_connector.py
+        shell: bash
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/connectors/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build-binaries
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release_assets/
+          merge-multiple: true
+
+      - name: List Artifacts
+        run: ls -la release_assets/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release_assets/*
+          draft: false
+          prerelease: false
+          generate_release_notes: true
