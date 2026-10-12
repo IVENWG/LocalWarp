@@ -92,24 +92,8 @@ class CoreDeviceLocationClient:
             except Exception as dt_e:
                 logger.warning(f"DtSimulateLocation fallback failed: {dt_e}")
 
-            # 4. Fallback: auto_mount DDI and retry CoreDevice
-            try:
-                from pymobiledevice3.services.mobile_image_mounter import auto_mount
-                logger.info("Attempting auto_mount developer disk image...")
-                await auto_mount(self.rsd)
-                await self.service.connect()
-                return await self.service.invoke(
-                    feature_identifier=self.FEATURE_LOCATION,
-                    input_=payload,
-                    action_identifier=self.ACTION_SET
-                )
-            except Exception as mount_e:
-                logger.warning(f"auto_mount attempt failed: {mount_e}")
-
-            # 5. Clear diagnostic error
             raise RuntimeError(
-                "无法激活定位服务 (No such service: com.apple.coredevice.locationservice)。"
-                "这通常是因为 iPhone 尚未开启【开发者模式】。请前往手机「设置 ➔ 隐私与安全性 ➔ 开发者模式」开启并重启手机确认。"
+                f"No such service: com.apple.coredevice.locationservice / com.apple.dt.simulatelocation (未挂载开发者磁盘镜像 DDI: {e})"
             )
 
     async def clear_simulated_location(self) -> Dict[str, Any]:
@@ -305,7 +289,8 @@ class CoreDeviceLocationManager:
 
     async def set_location(self, device_id: Optional[str], latitude: float, longitude: float) -> Dict[str, Any]:
         """
-        Set target latitude and longitude on device with fresh ephemeral session to prevent Errno 65 stale socket.
+        Set target latitude and longitude on device with fresh ephemeral session.
+        If service is not found, automatically mounts DDI / Cryptex and rebuilds session.
         """
         async with self._lock:
             key = device_id or "default"
@@ -313,9 +298,28 @@ class CoreDeviceLocationManager:
             client = await self._create_client(device_id)
             self.active_clients[key] = client
             try:
-                result = await client.set_simulated_location(latitude, longitude)
-                logger.info(f"Location successfully updated to lat={latitude}, lon={longitude}")
-                return result
+                try:
+                    result = await client.set_simulated_location(latitude, longitude)
+                    logger.info(f"Location successfully updated to lat={latitude}, lon={longitude}")
+                    return result
+                except Exception as first_e:
+                    err_str = str(first_e)
+                    if "No such service" in err_str:
+                        logger.info(f"Developer location service not yet activated on {key}. Attempting auto_mount DDI...")
+                        try:
+                            from pymobiledevice3.services.mobile_image_mounter import auto_mount
+                            await auto_mount(client.rsd)
+                            logger.info("DDI successfully mounted! Re-establishing fresh RSD session...")
+                            # Disconnect old session and rebuild clean session with updated services
+                            await self.disconnect_device(key)
+                            client = await self._create_client(device_id)
+                            self.active_clients[key] = client
+                            result = await client.set_simulated_location(latitude, longitude)
+                            logger.info(f"Location successfully updated after mounting DDI!")
+                            return result
+                        except Exception as mount_e:
+                            logger.warning(f"auto_mount retry error: {mount_e}")
+                    raise first_e
             finally:
                 # Clean up session to prevent tunnel staleness
                 await self.disconnect_device(key)
@@ -337,9 +341,26 @@ class CoreDeviceLocationManager:
             client = await self._create_client(target_id)
             self.active_clients[key] = client
             try:
-                result = await client.clear_simulated_location()
-                logger.info("Location simulation successfully cleared.")
-                return result
+                try:
+                    result = await client.clear_simulated_location()
+                    logger.info("Location simulation successfully cleared.")
+                    return result
+                except Exception as first_e:
+                    err_str = str(first_e)
+                    if "No such service" in err_str:
+                        logger.info(f"Location service not active on {key}. Attempting auto_mount DDI...")
+                        try:
+                            from pymobiledevice3.services.mobile_image_mounter import auto_mount
+                            await auto_mount(client.rsd)
+                            logger.info("DDI mounted! Rebuilding session...")
+                            await self.disconnect_device(key)
+                            client = await self._create_client(target_id)
+                            self.active_clients[key] = client
+                            result = await client.clear_simulated_location()
+                            return result
+                        except Exception as mount_e:
+                            logger.warning(f"auto_mount retry error: {mount_e}")
+                    raise first_e
             finally:
                 # Clean up session to prevent tunnel staleness
                 await self.disconnect_device(key)

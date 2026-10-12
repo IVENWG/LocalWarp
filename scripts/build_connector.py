@@ -71,8 +71,13 @@ def build():
         "--collect-all=construct",
         "--collect-all=zeroconf",
         "--collect-all=pytun_pmd3",
+        "--collect-all=pyimg4",
+        "--collect-all=readchar",
         "--copy-metadata=pytun_pmd3",
         "--copy-metadata=pymobiledevice3",
+        "--copy-metadata=pyimg4",
+        "--copy-metadata=readchar",
+        "--copy-metadata=apple_compress",
         # Hidden imports for uvicorn & async engines
         "--hidden-import=uvicorn.logging",
         "--hidden-import=uvicorn.loops",
@@ -92,6 +97,10 @@ def build():
         "--hidden-import=zeroconf",
         "--hidden-import=pydantic",
         "--hidden-import=pytun_pmd3",
+        "--hidden-import=pyimg4",
+        "--hidden-import=readchar",
+        "--hidden-import=ipsw_parser",
+        "--hidden-import=apple_compress",
         BACKEND_MAIN
     ])
 
