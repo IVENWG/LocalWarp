@@ -129,35 +129,37 @@ class CoreDeviceLocationManager:
         devices = []
         seen_udids = set()
 
-        # 1. Scan native CoreDevice tunnels (Active Wi-Fi / USB tunnels)
-        try:
-            from pymobiledevice3.remote.native_tunnel import browse_native_devices
-            records = await browse_native_devices(timeout=1.8)
-            for r in records:
-                udid = r.get("udid")
-                if not udid or udid in seen_udids:
-                    continue
-                seen_udids.add(udid)
-                raw_model = r.get("model", "Unknown")
-                friendly_model = IOS_MODEL_MAP.get(raw_model, raw_model)
-                name = r.get("name") or friendly_model
-                is_wireless = bool(r.get("wirelessConnectivity", False))
-                devices.append({
-                    "udid": udid,
-                    "name": name,
-                    "model": friendly_model,
-                    "raw_model": raw_model,
-                    "ecid": r.get("ecid"),
-                    "auth_state": r.get("authState", {}).get("rawCase", "authenticated"),
-                    "connection_type": "Wi-Fi" if is_wireless else "USB",
-                    "is_coredevice": True,
-                })
-        except Exception as e:
-            logger.warning(f"Native browse returned error: {e}")
+        # 1. Scan native CoreDevice tunnels (Active Wi-Fi / USB tunnels on macOS only)
+        if sys.platform == "darwin":
+            try:
+                from pymobiledevice3.remote.native_tunnel import browse_native_devices
+                records = await browse_native_devices(timeout=1.8)
+                for r in records:
+                    udid = r.get("udid")
+                    if not udid or udid in seen_udids:
+                        continue
+                    seen_udids.add(udid)
+                    raw_model = r.get("model", "Unknown")
+                    friendly_model = IOS_MODEL_MAP.get(raw_model, raw_model)
+                    name = r.get("name") or friendly_model
+                    is_wireless = bool(r.get("wirelessConnectivity", False))
+                    devices.append({
+                        "udid": udid,
+                        "name": name,
+                        "model": friendly_model,
+                        "raw_model": raw_model,
+                        "ecid": r.get("ecid"),
+                        "auth_state": r.get("authState", {}).get("rawCase", "authenticated"),
+                        "connection_type": "Wi-Fi" if is_wireless else "USB",
+                        "is_coredevice": True,
+                    })
+            except Exception as e:
+                logger.warning(f"Native browse returned error: {e}")
 
         # 2. Scan physical usbmux devices (Direct USB plug-in)
         try:
             from pymobiledevice3.usbmux import list_devices as usbmux_list
+            from pymobiledevice3.exceptions import ConnectionFailedToUsbmuxdError
             mux_devs = await usbmux_list()
             for d in mux_devs:
                 serial = getattr(d, "serial", None) or getattr(d, "udid", None)
@@ -175,13 +177,22 @@ class CoreDeviceLocationManager:
                     "is_coredevice": False,
                 })
         except Exception as e:
-            logger.warning(f"Usbmux list failed: {e}")
+            from pymobiledevice3.exceptions import ConnectionFailedToUsbmuxdError
+            if isinstance(e, ConnectionFailedToUsbmuxdError):
+                if sys.platform == "win32":
+                    logger.warning("[!] Windows 未检测到 Apple 移动设备服务 (Apple Mobile Device Service)。请安装 iTunes (官方64位版) 或启动该服务以连接 iPhone。")
+                elif sys.platform.startswith("linux"):
+                    logger.warning("[!] Linux 无法连接 /var/run/usbmuxd。请运行 'sudo systemctl start usbmuxd'。")
+                else:
+                    logger.warning("[!] 无法连接本地 usbmuxd 套接字。")
+            else:
+                logger.warning(f"Usbmux list failed: {type(e).__name__} - {e}")
 
         return devices
 
     async def _create_client(self, device_id: Optional[str] = None) -> CoreDeviceLocationClient:
         logger.info(f"Establishing clean RSD connection for device: {device_id or 'default'} (userspace={self.use_userspace})")
-        if self.use_userspace:
+        if self.use_userspace or sys.platform != "darwin":
             from pymobiledevice3.remote import userspace_tunnel
             rsd = await asyncio.wait_for(userspace_tunnel.establish_userspace_rsd(serial=device_id), timeout=8.0)
         else:
