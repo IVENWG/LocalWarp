@@ -290,6 +290,30 @@ def print_banner(host: str, port: int):
 """
     print(banner)
 
+    if platform.system() == "Windows":
+        import socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(0.5)
+        has_driver = False
+        try:
+            sock.connect(("127.0.0.1", 27015))
+            has_driver = True
+            sock.close()
+        except Exception:
+            sock.close()
+
+        if not has_driver:
+            print("*" * 76)
+            print("[!] 提示: 检测到当前 Windows 电脑尚未安装 Apple 基础通信驱动 (AMDS)")
+            print("-" * 76)
+            print("请按照以下两步完成首次环境配置（仅需首次安装一次）:")
+            print("  【步骤 1】安装 Apple 官方底层通信驱动:")
+            print("            官方直链: https://www.apple.com/itunes/download/win64")
+            print("            (或在微软应用商店搜索安装 'Apple Devices')")
+            print("  【步骤 2】将 iPhone 插入电脑，解锁手机并在弹窗中点击【信任此电脑】")
+            print("            装完后本程序将自动连通！")
+            print("*" * 76 + "\n")
+
 
 # ==============================================================================
 # CLI Entry Point
