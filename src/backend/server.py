@@ -39,7 +39,7 @@ except ImportError:
     # Support bundled binary execution
     from src.poc.coredevice_location_poc import CoreDeviceLocationManager
 
-VERSION = "1.0.1"
+VERSION = "1.0.3"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("LocalWarpConnector")
@@ -59,8 +59,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global manager instance
-manager = CoreDeviceLocationManager(use_userspace=False)
+# Global manager instance (Userspace tunnel for Windows/Linux, native tunnel for macOS)
+is_darwin = platform.system() == "Darwin"
+manager = CoreDeviceLocationManager(use_userspace=not is_darwin)
 connected_websockets: List[WebSocket] = []
 
 

@@ -70,6 +70,9 @@ def build():
         "--collect-all=pymobiledevice3",
         "--collect-all=construct",
         "--collect-all=zeroconf",
+        "--collect-all=pytun_pmd3",
+        "--copy-metadata=pytun_pmd3",
+        "--copy-metadata=pymobiledevice3",
         # Hidden imports for uvicorn & async engines
         "--hidden-import=uvicorn.logging",
         "--hidden-import=uvicorn.loops",
@@ -88,8 +91,28 @@ def build():
         "--hidden-import=construct",
         "--hidden-import=zeroconf",
         "--hidden-import=pydantic",
+        "--hidden-import=pytun_pmd3",
         BACKEND_MAIN
     ])
+
+    # Explicitly include pytun_pmd3 package directory and wintun.dll binaries
+    try:
+        import pytun_pmd3
+        pytun_dir = os.path.abspath(os.path.dirname(pytun_pmd3.__file__))
+        cmd.append(f"--add-data={pytun_dir}{sep}pytun_pmd3")
+        wintun_dir = os.path.join(pytun_dir, "wintun")
+        if os.path.exists(wintun_dir):
+            cmd.append(f"--add-data={wintun_dir}{sep}pytun_pmd3/wintun")
+            wintun_bin = os.path.join(wintun_dir, "bin")
+            if os.path.exists(wintun_bin):
+                cmd.append(f"--add-data={wintun_bin}{sep}pytun_pmd3/wintun/bin")
+                if system == "windows":
+                    cmd.append(f"--add-binary={wintun_bin}/*;pytun_pmd3/wintun/bin")
+                    wintun_amd64 = os.path.join(wintun_bin, "amd64")
+                    if os.path.exists(wintun_amd64):
+                        cmd.append(f"--add-binary={wintun_amd64}/*;pytun_pmd3/wintun/bin/amd64")
+    except Exception as e:
+        print(f"[*] Note discovering pytun_pmd3: {e}")
     
     print("[*] Running command:")
     print(" ".join(cmd))
