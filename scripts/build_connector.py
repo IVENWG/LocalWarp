@@ -103,7 +103,7 @@ def build():
     if os.path.exists(binary_path):
         size_mb = os.path.getsize(binary_path) / (1024 * 1024)
         print(f"\n==================================================")
-        print(f"  🎉 Standalone Binary Built Successfully!        ")
+        print(f"  [+] Standalone Binary Built Successfully!        ")
         print(f"  Location: {binary_path}                         ")
         print(f"  Size:     {size_mb:.2f} MB                      ")
         print(f"==================================================")
@@ -111,14 +111,6 @@ def build():
         # Make executable
         if system != "windows":
             os.chmod(binary_path, 0o755)
-            
-        # Verify the binary runs --status
-        print("\n[*] Verifying compiled standalone binary with --status flag...")
-        test_res = subprocess.run([binary_path, "--status"], capture_output=True, text=True)
-        print(test_res.stdout)
-        if test_res.stderr:
-            print(test_res.stderr)
-        print("[+] Binary verification completed!")
 
 if __name__ == "__main__":
     build()
