@@ -39,7 +39,7 @@ except ImportError:
     # Support bundled binary execution
     from src.poc.coredevice_location_poc import CoreDeviceLocationManager
 
-VERSION = "1.0.6"
+VERSION = "1.0.7"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("LocalWarpConnector")
