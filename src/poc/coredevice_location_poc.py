@@ -25,17 +25,29 @@ import asyncio
 import logging
 from typing import List, Dict, Any, Optional
 
-# Add pymobiledevice3 to python path if not installed globally
+# pymobiledevice3 以 pip 安装版为准（与 CI 打包环境一致）；vendored 副本仅作未安装时的兜底，
+# append 到搜索路径末尾，保证 pip 版存在时永远优先于 vendored 版
 repo_pmd3 = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../external_research/pymobiledevice3"))
 if os.path.exists(repo_pmd3) and repo_pmd3 not in sys.path:
-    sys.path.insert(0, repo_pmd3)
+    sys.path.append(repo_pmd3)
 
 from pymobiledevice3.remote.remote_service_discovery import RemoteServiceDiscoveryService
 from pymobiledevice3.remote.core_device.core_device_service import CoreDeviceService
-from pymobiledevice3.exceptions import CoreDeviceError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("CoreDeviceLocationPoC")
+
+
+class DeveloperModeDisabledError(RuntimeError):
+    """iPhone 未开启开发者模式：确定性错误，重建会话无济于事，须原样透传给前端引导。"""
+
+
+# 单次定位写入全链路（devmode 查询 + connect + invoke + 回退链）的超时预算。
+# 隧道黑洞化时 connect() 会挂满 OS 级 TCP SYN 超时（macOS 默认 75s）并占住
+# manager 全局锁，把整个定位 API 冻结一分多钟，必须在此提前掐断按会话失活处理
+INVOKE_TIMEOUT_S = 15.0
+# DDI 挂载（首次可能含镜像下载）预算：慢但必须有界
+MOUNT_TIMEOUT_S = 120.0
 
 
 class CoreDeviceLocationClient:
@@ -44,25 +56,31 @@ class CoreDeviceLocationClient:
     ACTION_CLEAR = "com.apple.coredevice.action.clearsimulatedlocation"
     FEATURE_LOCATION = "com.apple.coredevice.feature.simulatelocation"
 
-    def __init__(self, rsd: RemoteServiceDiscoveryService):
+    def __init__(self, rsd: RemoteServiceDiscoveryService, tunnel: Optional[Any] = None):
         self.rsd = rsd
+        # 持有隧道句柄：请求结束后由 manager aclose，连带释放 RSD 连接与隧道本体
+        self.tunnel = tunnel
         self.service = CoreDeviceService(rsd, self.SERVICE_NAME)
+        # 会话内已确认开发者模式开启：避免巡航 10Hz 下每次写入都多一趟远端查询
+        self._dev_mode_verified = False
 
     async def set_simulated_location(self, latitude: float, longitude: float) -> Dict[str, Any]:
         """
         Set simulated location with {latitude: double, longitude: double} flat payload.
         Supports CoreDevice LocationService with automatic fallback to DtSimulateLocation and auto_mount.
         """
-        # 1. Check Developer Mode status first
-        if hasattr(self.rsd, "get_developer_mode_status") and getattr(self.rsd, "has_developer_mode", False):
+        # 1. Check Developer Mode status first（会话内只查一次，查询不可用时也不再重试刷日志）
+        if not self._dev_mode_verified and hasattr(self.rsd, "get_developer_mode_status"):
             try:
                 is_dev = await self.rsd.get_developer_mode_status()
                 if not is_dev:
-                    raise RuntimeError("您的 iPhone 尚未开启【开发者模式】。请在手机「设置 ➔ 隐私与安全性 ➔ 开发者模式」中开启并重启手机。")
+                    raise DeveloperModeDisabledError("您的 iPhone 尚未开启【开发者模式】。请在手机「设置 ➔ 隐私与安全性 ➔ 开发者模式」中开启并重启手机。")
+                self._dev_mode_verified = True
             except Exception as e:
-                if "尚未开启" in str(e):
+                if isinstance(e, DeveloperModeDisabledError):
                     raise
                 logger.warning(f"Developer mode check error: {e}")
+                self._dev_mode_verified = True
 
         payload = {
             "latitude": float(latitude),
@@ -80,7 +98,17 @@ class CoreDeviceLocationClient:
             )
             return result
         except Exception as e:
+            if "No such service" in str(e):
+                # DDI 未挂载的标志性错误：必须透传给 manager 触发 auto_mount，
+                # 不能被 DVT/DtSimulateLocation 回退链吞掉
+                raise
             logger.warning(f"CoreDevice locationservice invocation failed: {e}. Trying DVT Instruments...")
+        finally:
+            # 巡航/摇杆是背靠背高频调用，必须每次释放服务连接，否则设备侧会话持续累积
+            try:
+                await self.service.close()
+            except Exception:
+                pass
 
         # 3. Standard iOS 17+ channel: DVT Instruments LocationSimulation
         try:
@@ -104,7 +132,7 @@ class CoreDeviceLocationClient:
             logger.warning(f"DtSimulateLocation fallback failed: {dt_e}")
 
         raise RuntimeError(
-            "未检测到可用定位服务。若为首次连接，请重试以自动挂载开发者镜像。"
+            "未检测到可用定位服务。请确认 iPhone 已开启【开发者模式】并重启过手机后重试。"
         )
 
     async def clear_simulated_location(self) -> Dict[str, Any]:
@@ -123,7 +151,15 @@ class CoreDeviceLocationClient:
             )
             return result
         except Exception as e:
+            if "No such service" in str(e):
+                # 同 set：透传给 manager 触发 auto_mount
+                raise
             logger.warning(f"CoreDevice clear location failed: {e}. Trying DVT Instruments...")
+        finally:
+            try:
+                await self.service.close()
+            except Exception:
+                pass
 
         # 2. Standard iOS 17+ channel: DVT Instruments LocationSimulation
         try:
@@ -188,7 +224,6 @@ IOS_MODEL_MAP = {
 class CoreDeviceLocationManager:
     def __init__(self, use_userspace: bool = False):
         self.use_userspace = use_userspace
-        self.active_sessions: Dict[str, RemoteServiceDiscoveryService] = {}
         self.active_clients: Dict[str, CoreDeviceLocationClient] = {}
         self._lock = asyncio.Lock()
 
@@ -213,6 +248,17 @@ class CoreDeviceLocationManager:
                     friendly_model = IOS_MODEL_MAP.get(raw_model, raw_model)
                     name = r.get("name") or friendly_model
                     is_wireless = bool(r.get("wirelessConnectivity", False))
+                    # remotepairingd 会把「有配对记录」的设备都报出来（Xcode 灰色设备同源）。
+                    # connectionState 只反映「当前是否存在活动连接」：connected=在链；
+                    # available 既可能是关机/离网，也可能是空闲在网（实测 available 状态下
+                    # 按需建链写入依然成功），没有任何字段能进一步区分二者——
+                    # 真实可达性只有尝试建隧道才知道（失败时由 _create_client 给出引导）。
+                    # wirelessConnectivity 不能用作在线判据——它对离线设备仍为真值
+                    conn_state = r.get("connectionState")
+                    if isinstance(conn_state, dict):
+                        state_str = str(conn_state.get("rawCase", "unknown"))
+                    else:
+                        state_str = "connected" if conn_state else "unknown"
                     devices.append({
                         "udid": udid,
                         "name": name,
@@ -222,6 +268,8 @@ class CoreDeviceLocationManager:
                         "auth_state": r.get("authState", {}).get("rawCase", "authenticated"),
                         "connection_type": "Wi-Fi" if is_wireless else "USB",
                         "is_coredevice": True,
+                        "online": state_str == "connected",
+                        "connection_state": state_str,
                     })
             except Exception as e:
                 logger.warning(f"Native browse returned error: {e}")
@@ -231,41 +279,60 @@ class CoreDeviceLocationManager:
             from pymobiledevice3.usbmux import list_devices as usbmux_list
             from pymobiledevice3.exceptions import ConnectionFailedToUsbmuxdError
             mux_devs = await usbmux_list()
-            for d in mux_devs:
-                serial = getattr(d, "serial", None) or getattr(d, "udid", None)
-                if not serial or serial in seen_udids:
-                    continue
-                seen_udids.add(serial)
+
+            async def probe_mux_device(serial: str, ecid: Any) -> Dict[str, Any]:
                 dev_entry = {
                     "udid": serial,
                     "name": "iOS Device (USB)",
                     "model": "iPhone (USB)",
                     "raw_model": "usbmux",
-                    "ecid": getattr(d, "ecid", None),
+                    "ecid": ecid,
                     "auth_state": "paired_usb",
                     "connection_type": "USB",
                     "is_coredevice": False,
+                    "online": True,
                     "developer_mode": None,
                 }
                 # Check developer mode status & auto-reveal option in Settings UI
                 try:
                     from pymobiledevice3.lockdown import create_using_usbmux
                     from pymobiledevice3.services.amfi import AmfiService
-                    lk = await create_using_usbmux(serial=serial)
-                    if hasattr(lk, "get_developer_mode_status"):
-                        dev_on = await lk.get_developer_mode_status()
-                        dev_entry["developer_mode"] = dev_on
-                        if dev_on is False:
-                            try:
-                                await AmfiService(lk).reveal_developer_mode_option_in_ui()
-                                dev_entry["developer_mode_revealed"] = True
-                                logger.info(f"Auto-revealed Developer Mode toggle in UI for {serial}")
-                            except Exception as rev_e:
-                                logger.debug(f"Auto-reveal notice: {rev_e}")
+                    # 本接口被前端每 4 秒轮询：未配对设备若无限等待信任对话框，
+                    # 每次轮询都会新挂起一个协程，必须限时返回
+                    lk = await create_using_usbmux(serial=serial, pair_timeout=2.0)
+                    try:
+                        if hasattr(lk, "get_developer_mode_status"):
+                            dev_on = await lk.get_developer_mode_status()
+                            dev_entry["developer_mode"] = dev_on
+                            if dev_on is False:
+                                try:
+                                    await AmfiService(lk).reveal_developer_mode_option_in_ui()
+                                    dev_entry["developer_mode_revealed"] = True
+                                    logger.info(f"Auto-revealed Developer Mode toggle in UI for {serial}")
+                                except Exception as rev_e:
+                                    logger.debug(f"Auto-reveal notice: {rev_e}")
+                    finally:
+                        # 轮询高频调用，必须显式关闭 usbmux 连接，否则 socket 无限累积
+                        try:
+                            await lk.close()
+                        except Exception:
+                            pass
                 except Exception as lk_e:
                     logger.debug(f"Device lockdown probe error for {serial}: {lk_e}")
+                return dev_entry
 
-                devices.append(dev_entry)
+            candidates = []
+            for d in mux_devs:
+                serial = getattr(d, "serial", None) or getattr(d, "udid", None)
+                if not serial or serial in seen_udids:
+                    continue
+                seen_udids.add(serial)
+                candidates.append((serial, getattr(d, "ecid", None)))
+            # 并行探测：多台未信任设备时避免 2s/台的串行配对等待把接口拖过前端超时预算
+            if candidates:
+                devices.extend(
+                    await asyncio.gather(*(probe_mux_device(serial, ecid) for serial, ecid in candidates))
+                )
         except Exception as e:
             from pymobiledevice3.exceptions import ConnectionFailedToUsbmuxdError
             if isinstance(e, ConnectionFailedToUsbmuxdError):
@@ -282,57 +349,119 @@ class CoreDeviceLocationManager:
 
     async def _create_client(self, device_id: Optional[str] = None) -> CoreDeviceLocationClient:
         logger.info(f"Establishing clean RSD connection for device: {device_id or 'default'} (userspace={self.use_userspace})")
+        tunnel = None
         if self.use_userspace or sys.platform != "darwin":
-            from pymobiledevice3.remote import userspace_tunnel
-            rsd = await asyncio.wait_for(userspace_tunnel.establish_userspace_rsd(serial=device_id), timeout=8.0)
+            from pymobiledevice3.remote.userspace_tunnel import UserspaceRsdTunnel
+            # 官方建议嵌入方直接持有隧道句柄：CLI 包装器会把隧道缓存在模块全局里，
+            # 换第二台设备时永远命中旧缓存而失败。直接构造 + 用完 aclose 即天然 ephemeral。
+            tunnel = UserspaceRsdTunnel(serial=device_id)
+            try:
+                rsd = await asyncio.wait_for(tunnel.aopen(), timeout=8.0)
+            except Exception as e:
+                if "already active" not in str(e):
+                    raise
+                # PyTCP 栈是进程级单例：设备 A 的会话常驻会让设备 B 永远建不了隧道。
+                # 语义定为「后请求的设备优先」——断开全部现有会话让位后重试一次
+                logger.warning(f"Userspace tunnel singleton held by another device session; evicting ({e})")
+                for k in list(self.active_clients):
+                    await self.disconnect_device(k)
+                try:
+                    await tunnel.aclose()
+                except Exception:
+                    pass
+                tunnel = UserspaceRsdTunnel(serial=device_id)
+                rsd = await asyncio.wait_for(tunnel.aopen(), timeout=8.0)
         else:
             try:
-                from pymobiledevice3.remote import native_tunnel
-                rsd = await asyncio.wait_for(native_tunnel.establish_native_rsd(serial=device_id), timeout=8.0)
+                from pymobiledevice3.remote.native_tunnel import NativeRemotedTunnel
+                tunnel = NativeRemotedTunnel(serial=device_id)
+                # native 建链内部含最长 ~10s 的 browse + XPC 等待；超时取消会留下收不了尾的
+                # 孤儿线程（asyncio.to_thread 取消不掉），所以预算给足 20s，只兜真正的挂死
+                rsd = await asyncio.wait_for(tunnel.aopen(), timeout=20.0)
             except Exception as e:
                 logger.warning(f"Native tunnel failed: {e}. Falling back to userspace tunnel...")
-                from pymobiledevice3.remote import userspace_tunnel
-                rsd = await asyncio.wait_for(userspace_tunnel.establish_userspace_rsd(serial=device_id), timeout=8.0)
-        
-        client = CoreDeviceLocationClient(rsd)
+                if tunnel is not None:
+                    try:
+                        await tunnel.aclose()
+                    except Exception:
+                        pass
+                from pymobiledevice3.remote.userspace_tunnel import UserspaceRsdTunnel
+                tunnel = UserspaceRsdTunnel(serial=device_id)
+                rsd = await asyncio.wait_for(tunnel.aopen(), timeout=8.0)
+
+        client = CoreDeviceLocationClient(rsd, tunnel=tunnel)
+        return client
+
+    async def _create_client_checked(self, device_id: Optional[str], key: str) -> CoreDeviceLocationClient:
+        """_create_client 的门面：建链失败时把「设备不在线」翻译成可引导的中文错误并缓存新会话。"""
+        try:
+            client = await self._create_client(device_id)
+        except Exception as e:
+            if "no device matching" in str(e).lower():
+                raise RuntimeError(
+                    "iPhone 当前不在线：请确认手机已开机、解锁，并与本机处于同一 Wi-Fi（或改用数据线连接）后重试。"
+                ) from e
+            raise
+        self.active_clients[key] = client
         return client
 
     async def set_location(self, device_id: Optional[str], latitude: float, longitude: float) -> Dict[str, Any]:
         """
-        Set target latitude and longitude on device with fresh ephemeral session.
-        If service is not found, automatically mounts DDI / Cryptex and rebuilds session.
+        Set target latitude and longitude on device.
+        会话常驻复用：首次调用建立隧道并缓存在 active_clients，后续调用直接复用，
+        把巡航/摇杆高频写入从「每次整链重建 ~1.6s」降到单次服务调用的亚秒级；
+        会话失活（Errno 65 / 设备重启 / 服务缺失 / 写入超时）时丢弃重建并重试一次。
         """
         async with self._lock:
             key = device_id or "default"
-            await self.disconnect_device(key)
-            client = await self._create_client(device_id)
-            self.active_clients[key] = client
+            client = self.active_clients.get(key)
+            if client is None:
+                client = await self._create_client_checked(device_id, key)
             try:
-                try:
-                    result = await client.set_simulated_location(latitude, longitude)
-                    logger.info(f"Location successfully updated to lat={latitude}, lon={longitude}")
-                    return result
-                except Exception as first_e:
-                    err_str = str(first_e)
-                    if "No such service" in err_str:
-                        logger.info(f"Developer location service not yet activated on {key}. Attempting auto_mount DDI...")
-                        try:
-                            from pymobiledevice3.services.mobile_image_mounter import auto_mount
-                            await auto_mount(client.rsd)
-                            logger.info("DDI successfully mounted! Re-establishing fresh RSD session...")
-                            # Disconnect old session and rebuild clean session with updated services
+                for attempt in (0, 1):  # 0=复用缓存会话, 1=丢弃重建后重试
+                    if attempt == 1:
+                        logger.warning(f"Rebuilding tunnel session for {key}...")
+                        await self.disconnect_device(key)
+                        client = await self._create_client_checked(device_id, key)
+                    try:
+                        result = await asyncio.wait_for(
+                            client.set_simulated_location(latitude, longitude), timeout=INVOKE_TIMEOUT_S
+                        )
+                        logger.info(f"Location successfully updated to lat={latitude}, lon={longitude}")
+                        return result
+                    except Exception as e:
+                        if isinstance(e, DeveloperModeDisabledError):
+                            # 确定性错误，重建会话也不会好转，直接透传
+                            raise
+                        if "No such service" in str(e):
+                            # DDI 未挂载：借当前还活着的 RSD 会话挂载开发者镜像，换新会话重试。
+                            # 首试与重建后的重试都可能命中（重建后服务枚举存在竞态），两处都必须处理
+                            logger.info(f"Developer location service not yet activated on {key}. Attempting auto_mount DDI...")
+                            try:
+                                from pymobiledevice3.services.mobile_image_mounter import auto_mount
+                                await asyncio.wait_for(auto_mount(client.rsd), timeout=MOUNT_TIMEOUT_S)
+                                logger.info("DDI successfully mounted! Re-establishing fresh RSD session...")
+                            except Exception:
+                                logger.warning(f"auto_mount failed on {key}; giving up this request")
+                                raise e
                             await self.disconnect_device(key)
-                            client = await self._create_client(device_id)
-                            self.active_clients[key] = client
-                            result = await client.set_simulated_location(latitude, longitude)
-                            logger.info(f"Location successfully updated after mounting DDI!")
+                            client = await self._create_client_checked(device_id, key)
+                            result = await asyncio.wait_for(
+                                client.set_simulated_location(latitude, longitude), timeout=INVOKE_TIMEOUT_S
+                            )
+                            logger.info("Location successfully updated (DDI mounted, session rebuilt).")
                             return result
-                        except Exception as mount_e:
-                            logger.warning(f"auto_mount retry error: {mount_e}")
-                    raise first_e
-            finally:
-                # Clean up session to prevent tunnel staleness
-                await self.disconnect_device(key)
+                        if attempt == 0:
+                            logger.warning(f"Reused session failed ({e}); rebuilding tunnel session...")
+                            continue
+                        raise
+            except BaseException:
+                # 请求最终失败（含重试失败/超时/客户端取消）：丢弃会话，不给下次调用留坏句柄
+                try:
+                    await self.disconnect_device(key)
+                except Exception:
+                    pass
+                raise
 
     async def simulate_location(self, latitude: float, longitude: float, udid: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -342,50 +471,75 @@ class CoreDeviceLocationManager:
 
     async def clear_location(self, device_id: Optional[str] = None, udid: Optional[str] = None) -> Dict[str, Any]:
         """
-        Clear simulated location and restore real GPS with fresh ephemeral session.
+        Clear simulated location and restore real GPS（会话常驻复用，同 set_location）。
         """
         target_id = udid or device_id
         async with self._lock:
             key = target_id or "default"
-            await self.disconnect_device(key)
-            client = await self._create_client(target_id)
-            self.active_clients[key] = client
+            client = self.active_clients.get(key)
+            if client is None:
+                client = await self._create_client_checked(target_id, key)
             try:
-                try:
-                    result = await client.clear_simulated_location()
-                    logger.info("Location simulation successfully cleared.")
-                    return result
-                except Exception as first_e:
-                    err_str = str(first_e)
-                    if "No such service" in err_str:
-                        logger.info(f"Location service not active on {key}. Attempting auto_mount DDI...")
-                        try:
-                            from pymobiledevice3.services.mobile_image_mounter import auto_mount
-                            await auto_mount(client.rsd)
-                            logger.info("DDI mounted! Rebuilding session...")
+                for attempt in (0, 1):  # 0=复用缓存会话, 1=丢弃重建后重试
+                    if attempt == 1:
+                        logger.warning(f"Rebuilding tunnel session for {key}...")
+                        await self.disconnect_device(key)
+                        client = await self._create_client_checked(target_id, key)
+                    try:
+                        result = await asyncio.wait_for(
+                            client.clear_simulated_location(), timeout=INVOKE_TIMEOUT_S
+                        )
+                        logger.info("Location simulation successfully cleared.")
+                        return result
+                    except Exception as e:
+                        if isinstance(e, DeveloperModeDisabledError):
+                            raise
+                        if "No such service" in str(e):
+                            logger.info(f"Location service not active on {key}. Attempting auto_mount DDI...")
+                            try:
+                                from pymobiledevice3.services.mobile_image_mounter import auto_mount
+                                await asyncio.wait_for(auto_mount(client.rsd), timeout=MOUNT_TIMEOUT_S)
+                                logger.info("DDI mounted! Rebuilding session...")
+                            except Exception:
+                                logger.warning(f"auto_mount failed on {key}; giving up this request")
+                                raise e
                             await self.disconnect_device(key)
-                            client = await self._create_client(target_id)
-                            self.active_clients[key] = client
-                            result = await client.clear_simulated_location()
+                            client = await self._create_client_checked(target_id, key)
+                            result = await asyncio.wait_for(
+                                client.clear_simulated_location(), timeout=INVOKE_TIMEOUT_S
+                            )
+                            logger.info("Location simulation successfully cleared (DDI mounted, session rebuilt).")
                             return result
-                        except Exception as mount_e:
-                            logger.warning(f"auto_mount retry error: {mount_e}")
-                    raise first_e
-            finally:
-                # Clean up session to prevent tunnel staleness
-                await self.disconnect_device(key)
+                        if attempt == 0:
+                            logger.warning(f"Reused session failed ({e}); rebuilding tunnel session...")
+                            continue
+                        raise
+            except BaseException:
+                try:
+                    await self.disconnect_device(key)
+                except Exception:
+                    pass
+                raise
 
     async def get_developer_mode_status(self, device_id: Optional[str] = None) -> Optional[bool]:
         """
         Check if Developer Mode is enabled on device.
         """
+        lockdown = None
         try:
             from pymobiledevice3.lockdown import create_using_usbmux
-            lockdown = await create_using_usbmux(serial=device_id)
+            # 前端每 4 秒轮询本接口，配对等待必须限时
+            lockdown = await create_using_usbmux(serial=device_id, pair_timeout=2.0)
             if hasattr(lockdown, "get_developer_mode_status"):
                 return await lockdown.get_developer_mode_status()
         except Exception as e:
             logger.debug(f"get_developer_mode_status failed: {e}")
+        finally:
+            if lockdown is not None:
+                try:
+                    await lockdown.close()
+                except Exception:
+                    pass
         return None
 
     async def reveal_developer_mode(self, device_id: Optional[str] = None) -> Dict[str, Any]:
@@ -394,8 +548,9 @@ class CoreDeviceLocationManager:
         """
         from pymobiledevice3.lockdown import create_using_usbmux
         from pymobiledevice3.services.amfi import AmfiService
+        lockdown = None
         try:
-            lockdown = await create_using_usbmux(serial=device_id)
+            lockdown = await create_using_usbmux(serial=device_id, pair_timeout=2.0)
             amfi = AmfiService(lockdown)
             await amfi.reveal_developer_mode_option_in_ui()
             logger.info(f"Successfully revealed developer mode option in UI for {device_id or 'default'}")
@@ -406,7 +561,13 @@ class CoreDeviceLocationManager:
             }
         except Exception as e:
             logger.error(f"Failed to reveal developer mode: {e}")
-            raise RuntimeError(f"点亮开发者模式失败: {e}")
+            raise RuntimeError("点亮开发者模式失败：请用 USB 数据线连接手机、解锁并点击「信任此电脑」后重试。")
+        finally:
+            if lockdown is not None:
+                try:
+                    await lockdown.close()
+                except Exception:
+                    pass
 
     async def enable_developer_mode(self, device_id: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -417,79 +578,80 @@ class CoreDeviceLocationManager:
         from pymobiledevice3.lockdown import create_using_usbmux
         from pymobiledevice3.services.amfi import AmfiService
         from pymobiledevice3.exceptions import DeviceHasPasscodeSetError
-        
-        lockdown = await create_using_usbmux(serial=device_id)
-        amfi = AmfiService(lockdown)
-        
-        # 1. 确保 UI 入口首先点亮
-        try:
-            await amfi.reveal_developer_mode_option_in_ui()
-        except Exception as e:
-            logger.debug(f"reveal in enable_developer_mode notice: {e}")
 
-        # 2. 检查是否已经开启
         try:
-            if hasattr(lockdown, "get_developer_mode_status") and await lockdown.get_developer_mode_status():
+            # 用户主动点击的操作：给手机上的信任弹窗留出等待时间
+            lockdown = await create_using_usbmux(serial=device_id, pair_timeout=15.0)
+        except Exception as e:
+            logger.error(f"enable_developer_mode connect failed: {e}")
+            raise RuntimeError("未能通过 USB 连接手机。请用数据线连接手机、解锁并点击「信任此电脑」后重试（Wi-Fi 连接的设备暂不支持此操作）。")
+        try:
+            amfi = AmfiService(lockdown)
+
+            # 1. 确保 UI 入口首先点亮
+            try:
+                await amfi.reveal_developer_mode_option_in_ui()
+            except Exception as e:
+                logger.debug(f"reveal in enable_developer_mode notice: {e}")
+
+            # 2. 检查是否已经开启
+            try:
+                if hasattr(lockdown, "get_developer_mode_status") and await lockdown.get_developer_mode_status():
+                    return {
+                        "success": True,
+                        "already_enabled": True,
+                        "rebooting": False,
+                        "message": "iPhone 当前已处于【开发者模式】，无需重复开启！"
+                    }
+            except Exception:
+                pass
+
+            # 3. 尝试直接触发开启并重启
+            try:
+                await amfi.enable_developer_mode(enable_post_restart=False)
+                logger.info(f"Triggered developer mode reboot on {device_id or 'default'}")
                 return {
                     "success": True,
-                    "already_enabled": True,
-                    "rebooting": False,
-                    "message": "iPhone 当前已处于【开发者模式】，无需重复开启！"
+                    "rebooting": True,
+                    "has_passcode": False,
+                    "message": "已向 iPhone 发送开启指令，手机即将自动重启！开机后请点击屏幕上的【开启】并确认即可。"
                 }
-        except Exception:
-            pass
-
-        # 3. 尝试直接触发开启并重启
-        try:
-            await amfi.enable_developer_mode(enable_post_restart=False)
-            logger.info(f"Triggered developer mode reboot on {device_id or 'default'}")
-            return {
-                "success": True,
-                "rebooting": True,
-                "has_passcode": False,
-                "message": "已向 iPhone 发送开启指令，手机即将自动重启！开机后请点击屏幕上的【开启】并确认即可。"
-            }
-        except DeviceHasPasscodeSetError:
-            logger.info("Device has passcode set. Revealed UI option successfully.")
-            return {
-                "success": True,
-                "rebooting": False,
-                "has_passcode": True,
-                "revealed": True,
-                "message": "已成功在 iPhone 上点亮隐藏的【开发者模式】！由于您的手机设有锁屏密码，苹果系统要求机主手动确认：请前往手机「设置 ➔ 隐私与安全性 ➔ 开发者模式」开启并重启输入密码。"
-            }
-        except Exception as e:
-            logger.error(f"enable_developer_mode error: {e}")
-            return {
-                "success": True,
-                "rebooting": False,
-                "revealed": True,
-                "message": f"已为您点亮 iPhone「设置 ➔ 隐私与安全性 ➔ 开发者模式」入口。请前往手机手动点击开启并重启。（原因：{e}）"
-            }
+            except DeviceHasPasscodeSetError:
+                logger.info("Device has passcode set. Revealed UI option successfully.")
+                return {
+                    "success": True,
+                    "rebooting": False,
+                    "has_passcode": True,
+                    "revealed": True,
+                    "message": "已成功在 iPhone 上点亮隐藏的【开发者模式】！由于您的手机设有锁屏密码，苹果系统要求机主手动确认：请前往手机「设置 ➔ 隐私与安全性 ➔ 开发者模式」开启并重启输入密码。"
+                }
+            except Exception as e:
+                logger.error(f"enable_developer_mode error: {e}")
+                return {
+                    "success": False,
+                    "rebooting": False,
+                    "revealed": False,
+                    "message": "开启指令发送失败。请重试一次；若仍失败，请在 iPhone「设置 ➔ 隐私与安全性 ➔ 开发者模式」手动开启。"
+                }
+        finally:
+            try:
+                await lockdown.close()
+            except Exception:
+                pass
 
     async def disconnect_device(self, device_id: str):
         key = device_id or "default"
-        if key in self.active_clients:
+        client = self.active_clients.pop(key, None)
+        if client is not None:
+            tunnel = getattr(client, "tunnel", None)
             try:
-                client = self.active_clients[key]
-                if hasattr(client, "rsd") and client.rsd:
+                if tunnel is not None:
+                    # aclose 幂等，且会把 RSD 连接、隧道、remoted 配对断言一并释放
+                    await tunnel.aclose()
+                elif getattr(client, "rsd", None) is not None:
                     await client.rsd.close()
-            except Exception:
-                pass
-            del self.active_clients[key]
-        if key in self.active_sessions:
-            try:
-                await self.active_sessions[key].close()
-            except Exception:
-                pass
-            del self.active_sessions[key]
-        # Force clear userspace tunnel CLI cache to force fresh RSD service discovery
-        try:
-            from pymobiledevice3.remote import userspace_tunnel
-            if getattr(userspace_tunnel, "_cli_tunnel", None):
-                userspace_tunnel._cli_tunnel = None
-        except Exception:
-            pass
+            except Exception as e:
+                logger.debug(f"Tunnel teardown notice for {key}: {e}")
 
 
 async def main():

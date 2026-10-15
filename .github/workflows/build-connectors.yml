@@ -1,4 +1,4 @@
-name: Build Standalone Connectors for 3 Platforms
+name: Build Standalone Connectors
 
 on:
   push:
@@ -20,6 +20,9 @@ jobs:
           - os: macos-latest
             arch: arm64
             artifact_name: LocalWarp-Connector-macos-arm64
+          - os: macos-15-intel
+            arch: x64
+            artifact_name: LocalWarp-Connector-macos-x64
           - os: ubuntu-latest
             arch: x64
             artifact_name: LocalWarp-Connector-linux-x64
@@ -36,7 +39,15 @@ jobs:
       - name: Install Build Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller uvicorn fastapi pydantic requests construct zeroconf pymobiledevice3 pytun-pmd3 pyimg4
+          # 运行依赖统一由 requirements-connector.txt 提供（单一真源，避免清单漂移）；
+          # pyinstaller 仅构建期需要，不进 requirements
+          pip install pyinstaller
+          pip install -r requirements-connector.txt
+        shell: bash
+
+      - name: Inject release version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: echo "LOCALWARP_BUILD_VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_ENV
         shell: bash
 
       - name: Compile Standalone Binary via PyInstaller
@@ -73,5 +84,6 @@ jobs:
         with:
           files: release_assets/*
           draft: false
-          prerelease: false
+          # 含 - 的 tag（v1.0.8-rc1 / -beta）自动标记为预发布，只有正式版本号才发正式版
+          prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true

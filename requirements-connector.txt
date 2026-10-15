@@ -1,0 +1,15 @@
+# LocalWarp Connector 运行依赖（本地开发与 CI 打包共用的单一真源；
+# CI 另行单独安装构建工具 pyinstaller）
+fastapi
+uvicorn
+pydantic
+requests
+cryptography
+construct
+construct-typing
+zeroconf
+pymobiledevice3
+pytun-pmd3
+# Windows 托盘 GUI（其他平台可省）
+pystray
+pillow
