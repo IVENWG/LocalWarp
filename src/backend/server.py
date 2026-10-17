@@ -48,7 +48,10 @@ try:
     # CI 打 tag 构建时由 build_connector.py 注入（build/version_stamp/_version.py）
     from _version import VERSION  # type: ignore[import-not-found]
 except Exception:
-    VERSION = "1.0.7"
+    VERSION = "1.1.0"
+
+# 云端权益授权：v1.1.0 起定位写入需要在线授权（短期内存缓存）
+from connector_auth import CloudAuthorizer, authorizer as cloud_authorizer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("LocalWarpConnector")
@@ -110,6 +113,17 @@ class ClearLocationRequest(BaseModel):
     udid: Optional[str] = Field(None, description="Device UDID (optional if single device)")
 
 
+class DisconnectDeviceRequest(BaseModel):
+    udid: Optional[str] = Field(None, description="Device UDID (optional if single device)")
+    restore_location: bool = Field(True, description="Whether to restore real GPS before disconnecting")
+
+
+class ConnectorAuthConfigureRequest(BaseModel):
+    token: str = Field(..., description="Scoped pairing token issued by the LocalWarp cloud")
+    cloud_url: str = Field(..., description="Trusted cloud origin, e.g. https://localwarp.com")
+    udid: Optional[str] = Field(None, description="Device UDID bound by this pairing")
+
+
 @app.get("/health")
 @app.get("/api/health")
 async def health_check():
@@ -118,7 +132,27 @@ async def health_check():
         "service": "LocalWarp Connector",
         "version": VERSION,
         "platform": platform.system(),
-        "arch": platform.machine()
+        "arch": platform.machine(),
+        # v1.1.0 起：声明支持云端权益授权，网页据此决定是否允许定位写入
+        "capabilities": ["cloud-auth"]
+    }
+
+
+@app.post("/api/auth/configure")
+async def configure_connector_auth(req: ConnectorAuthConfigureRequest):
+    """网页配对入口：保存受限令牌（仅内存）并立即向云端确认一次。"""
+    ok, detail = cloud_authorizer.configure(req.token, req.cloud_url, req.udid)
+    if not ok:
+        raise HTTPException(status_code=400, detail=detail)
+    return {"success": True, "message": "Connector authorized (memory only, cleared on restart)"}
+
+
+@app.get("/api/auth/status")
+async def connector_auth_status():
+    return {
+        "paired": cloud_authorizer.is_paired,
+        "version": VERSION,
+        "capabilities": ["cloud-auth"],
     }
 
 
@@ -140,6 +174,12 @@ async def list_devices():
 
 @app.post("/api/location/simulate")
 async def simulate_location(req: SimulateLocationRequest):
+    # 云端权益门禁：缓存命中时零开销；到期/未配对/云端不可达一律拒绝写入。
+    # 恢复真实定位（/api/location/clear）不受此限制。
+    ok, reason = cloud_authorizer.ensure_authorized(req.udid or "")
+    if not ok:
+        logger.warning(f"Simulate denied by cloud authorization: {reason}")
+        raise HTTPException(status_code=403, detail=reason)
     try:
         logger.info(f"Received simulate request: lat={req.latitude}, lon={req.longitude}, udid={req.udid}")
         result = await manager.simulate_location(
@@ -169,6 +209,32 @@ async def clear_location(req: ClearLocationRequest):
         }
     except Exception as e:
         logger.error(f"Failed to clear location: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/device/disconnect")
+@app.post("/api/device/{udid}/disconnect")
+async def disconnect_device(req: Optional[DisconnectDeviceRequest] = None, udid: Optional[str] = None):
+    target_udid = (req.udid if req else None) or udid
+    should_restore = req.restore_location if req is not None else True
+    logger.info(f"Received disconnect request for udid={target_udid}, restore_location={should_restore}")
+    try:
+        restored = False
+        if should_restore and target_udid:
+            try:
+                await manager.clear_location(udid=target_udid)
+                restored = True
+            except Exception as clr_e:
+                logger.warning(f"Could not restore location before disconnect: {clr_e}")
+        await manager.disconnect_device(device_id=target_udid or "")
+        return {
+            "success": True,
+            "message": "iPhone 连接已成功释放",
+            "udid": target_udid,
+            "restored_location": restored
+        }
+    except Exception as e:
+        logger.error(f"Failed to disconnect device: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

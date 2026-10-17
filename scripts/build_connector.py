@@ -100,6 +100,7 @@ def build():
         "--hidden-import=uvicorn.lifespans",
         "--hidden-import=uvicorn.lifespans.on",
         "--hidden-import=coredevice_location_poc",
+        "--hidden-import=connector_auth",
         "--hidden-import=pymobiledevice3",
         "--hidden-import=construct",
         "--hidden-import=zeroconf",

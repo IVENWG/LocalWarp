@@ -259,6 +259,22 @@ class CoreDeviceLocationManager:
                         state_str = str(conn_state.get("rawCase", "unknown"))
                     else:
                         state_str = "connected" if conn_state else "unknown"
+
+                    dev_mode = None
+                    kvs = r.get("deviceKVSData")
+                    if kvs:
+                        try:
+                            from pymobiledevice3.remote.remote_service_discovery import parse_device_kvs_data
+                            parsed_kvs = parse_device_kvs_data(kvs)
+                            amfi = parsed_kvs.get("com.apple.security.mac.amfi", {})
+                            if "DeveloperModeStatus" in amfi:
+                                dev_mode = bool(amfi["DeveloperModeStatus"])
+                        except Exception as kvs_e:
+                            logger.debug(f"Failed to parse deviceKVSData for {udid}: {kvs_e}")
+
+                    # remotepairingd 中：connected=已有活动隧道；available=在局域网(Wi-Fi)或有线中就绪可用
+                    is_online = state_str in ("connected", "available")
+
                     devices.append({
                         "udid": udid,
                         "name": name,
@@ -268,8 +284,9 @@ class CoreDeviceLocationManager:
                         "auth_state": r.get("authState", {}).get("rawCase", "authenticated"),
                         "connection_type": "Wi-Fi" if is_wireless else "USB",
                         "is_coredevice": True,
-                        "online": state_str == "connected",
+                        "online": is_online,
                         "connection_state": state_str,
+                        "developer_mode": dev_mode,
                     })
             except Exception as e:
                 logger.warning(f"Native browse returned error: {e}")
@@ -279,6 +296,20 @@ class CoreDeviceLocationManager:
             from pymobiledevice3.usbmux import list_devices as usbmux_list
             from pymobiledevice3.exceptions import ConnectionFailedToUsbmuxdError
             mux_devs = await usbmux_list()
+
+            mux_serials = set()
+            for d in mux_devs:
+                s = getattr(d, "serial", None) or getattr(d, "udid", None)
+                if s:
+                    mux_serials.add(s)
+
+            # 物理 USB 链路判定：物理直连权重最高。若设备已在 native browse 中出现，
+            # 但只要存在于 usbmux 物理设备列表中，则明确判定为在线且通道为 USB
+            for dev in devices:
+                if dev.get("udid") in mux_serials:
+                    dev["online"] = True
+                    dev["connection_type"] = "USB"
+                    dev["connection_state"] = "connected"
 
             async def probe_mux_device(serial: str, ecid: Any) -> Dict[str, Any]:
                 dev_entry = {
@@ -524,16 +555,44 @@ class CoreDeviceLocationManager:
     async def get_developer_mode_status(self, device_id: Optional[str] = None) -> Optional[bool]:
         """
         Check if Developer Mode is enabled on device.
+        Supports both USB (usbmux lockdown) and Wi-Fi (active tunnel RSD & native browse KVS).
         """
+        key = device_id or "default"
+        # 1. 优先从已有活动隧道会话获取
+        if key in self.active_clients:
+            client = self.active_clients[key]
+            if hasattr(client.rsd, "get_developer_mode_status"):
+                try:
+                    return await client.rsd.get_developer_mode_status()
+                except Exception as rsd_e:
+                    logger.debug(f"rsd get_developer_mode_status error for {key}: {rsd_e}")
+
+        # 2. 从 macOS native browse 的 deviceKVSData 中解析（毫秒级，完美支持 Wi-Fi 设备）
+        if sys.platform == "darwin":
+            try:
+                from pymobiledevice3.remote.native_tunnel import browse_native_devices
+                from pymobiledevice3.remote.remote_service_discovery import parse_device_kvs_data
+                records = await browse_native_devices(timeout=1.2)
+                for r in records:
+                    if not device_id or r.get("udid") == device_id:
+                        kvs = r.get("deviceKVSData")
+                        if kvs:
+                            parsed = parse_device_kvs_data(kvs)
+                            amfi = parsed.get("com.apple.security.mac.amfi", {})
+                            if "DeveloperModeStatus" in amfi:
+                                return bool(amfi["DeveloperModeStatus"])
+            except Exception as kvs_e:
+                logger.debug(f"native browse get_developer_mode_status error for {key}: {kvs_e}")
+
+        # 3. 尝试 USB lockdown 通道（仅物理连入 USB 时可用）
         lockdown = None
         try:
             from pymobiledevice3.lockdown import create_using_usbmux
-            # 前端每 4 秒轮询本接口，配对等待必须限时
-            lockdown = await create_using_usbmux(serial=device_id, pair_timeout=2.0)
+            lockdown = await create_using_usbmux(serial=device_id, pair_timeout=1.5)
             if hasattr(lockdown, "get_developer_mode_status"):
                 return await lockdown.get_developer_mode_status()
         except Exception as e:
-            logger.debug(f"get_developer_mode_status failed: {e}")
+            logger.debug(f"usbmux get_developer_mode_status failed: {e}")
         finally:
             if lockdown is not None:
                 try:
