@@ -1,5 +1,13 @@
 # LocalWarp Connector 运行依赖（本地开发与 CI 打包共用的单一真源；
-# CI 另行单独安装构建工具 pyinstaller）
+# 构建工具见 requirements-connector-build.txt）
+#
+# 核心依赖必须固定版本：不同 pymobiledevice3 版本的 CoreDevice/RSD/DDI 行为
+# 可能不同，未固定会让「本机测试通过、CI 打包出另一个实现」。升级时先跑
+# 后端与设备会话相关测试，再改这里的版本号。
+# 11.36.0 已用后端 64 项测试验证；包含 userspace 隧道吞吐修复（8 KiB→1 MiB）
+# 与 Cryptex DDI 缓存路径修复，直接改善 Windows/Linux 的巡航写入平滑度。
+pymobiledevice3==11.36.0
+pytun-pmd3==3.0.3
 fastapi
 uvicorn
 pydantic
@@ -8,8 +16,6 @@ cryptography
 construct
 construct-typing
 zeroconf
-pymobiledevice3
-pytun-pmd3
 # Windows 托盘 GUI（其他平台可省）
 pystray
 pillow

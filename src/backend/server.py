@@ -16,12 +16,15 @@ import sys
 import os
 import re
 import argparse
+import asyncio
+import ipaddress
 import logging
 import platform
 import shlex
 import subprocess
 import xml.sax.saxutils
-from typing import Optional
+from typing import Dict, List, Optional
+from urllib.parse import urlsplit
 from pydantic import BaseModel, Field
 
 # Ensure repo and pymobiledevice3 in path
@@ -44,6 +47,13 @@ except ImportError:
     # Support bundled binary execution
     from src.poc.coredevice_location_poc import CoreDeviceLocationManager
 
+# 多设备路由门面（v1.5+）：macOS 原生并行 + userspace 平台设备 worker 进程。
+# 表面与 CoreDeviceLocationManager 兼容，REST 层无需感知路由细节。
+try:
+    from multi_device import MultiDeviceManager
+except ImportError:
+    from src.backend.multi_device import MultiDeviceManager
+
 try:
     # CI 打 tag 构建时由 build_connector.py 注入（build/version_stamp/_version.py）
     from _version import VERSION  # type: ignore[import-not-found]
@@ -55,6 +65,8 @@ from connector_auth import CloudAuthorizer, authorizer as cloud_authorizer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("LocalWarpConnector")
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 28888
 
 app = FastAPI(
     title="LocalWarp Connector",
@@ -62,55 +74,153 @@ app = FastAPI(
     version=VERSION
 )
 
-# CORS: 只放行本机/局域网 IP 来源与生产站点。
+_IPV4_OCTET = r"(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])"
+_LOOPBACK_IPV4_ORIGIN = rf"127\.{_IPV4_OCTET}\.{_IPV4_OCTET}\.{_IPV4_OCTET}"
+
+# CORS: 只放行本机回环来源与生产站点（严禁放行任意 RFC1918 局域网来源）。
 # 绝不能用 allow_origins=["*"] + allow_credentials=True 的组合——Starlette 会把
 # 任意请求 Origin 原样反射回响应头，等于允许任何恶意网页驱动本机连接器。
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=(
-        r"^https?://(localhost|127\.0\.0\.1|\[::1\]|"
-        r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})(:\d+)?$"
-        r"|^https://localwarp\.com$"
+        rf"^https?://(?:localhost|\[::1\]|{_LOOPBACK_IPV4_ORIGIN})(?::\d+)?$"
+        r"|^https://(?:www\.)?localwarp\.com$"
     ),
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Host/Origin 防护：拦截 DNS rebinding（Host 非本机/局域网名）与公网站点的
-# 跨站请求（Origin 非白名单）。无 Origin 的同源导航与 curl/python 客户端不受影响。
-_ALLOWED_HOST = re.compile(
-    r"^(localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0|"
-    r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|"
-    r"172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|localwarp\.com)$"
+# Host/Origin/Client 防护：只接受本机回环地址（127.0.0.0/8、::1、localhost）和产品域名。
+# 不放行任意 RFC1918/ULA 局域网地址，防止局域网网页或主机未授权读取设备或触发断开/恢复操作。
+_LOOPBACK_NETWORKS = tuple(
+    ipaddress.ip_network(network)
+    for network in (
+        "127.0.0.0/8",
+        "::1/128",
+    )
 )
+_TRUSTED_WEB_HOSTS = {"localwarp.com", "www.localwarp.com"}
+
+
+def _is_allowed_local_host(hostname: Optional[str]) -> bool:
+    if not hostname:
+        return False
+    normalized = hostname.rstrip(".").lower()
+    if normalized == "localhost":
+        return True
+    try:
+        address = ipaddress.ip_address(normalized)
+    except ValueError:
+        return False
+    return any(address.version == network.version and address in network for network in _LOOPBACK_NETWORKS)
+
+
+def _validate_loopback_bind_host(value: str) -> str:
+    candidate = (value or "").strip()
+    if candidate.startswith("[") and candidate.endswith("]"):
+        candidate = candidate[1:-1]
+    if not _is_allowed_local_host(candidate):
+        raise argparse.ArgumentTypeError(
+            f"Connector must bind to a loopback address (e.g. 127.0.0.1, ::1, or localhost); got {value!r}"
+        )
+    return candidate
+
+
+def _is_allowed_origin(origin: str) -> bool:
+    try:
+        parsed = urlsplit(origin)
+        # Browser Origin values have no credentials, path, query, or fragment.
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.netloc
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            return False
+        _ = parsed.port  # Validate that an explicit port is numeric and in range.
+    except ValueError:
+        return False
+    hostname = parsed.hostname
+    if hostname and hostname.rstrip(".").lower() in _TRUSTED_WEB_HOSTS:
+        return parsed.scheme == "https"
+    return _is_allowed_local_host(hostname)
+
+
+def _is_allowed_request_host(authority: str) -> bool:
+    try:
+        parsed = urlsplit(f"//{authority}")
+        if not parsed.hostname or parsed.username is not None or parsed.password is not None or parsed.path:
+            return False
+        _ = parsed.port  # Validate that an explicit port is numeric and in range.
+    except ValueError:
+        return False
+    return _is_allowed_local_host(parsed.hostname)
 
 
 @app.middleware("http")
 async def guard_local_access(request: Request, call_next):
-    host = (request.headers.get("host") or "").rsplit(":", 1)[0].strip().lower()
-    if host and not _ALLOWED_HOST.match(host):
+    client_host = getattr(getattr(request, "client", None), "host", None)
+    if client_host and client_host != "testclient" and not _is_allowed_local_host(client_host):
+        return JSONResponse({"detail": "forbidden client"}, status_code=403)
+    host = (request.headers.get("host") or "").strip()
+    if host and not _is_allowed_request_host(host):
         return JSONResponse({"detail": "forbidden host"}, status_code=403)
     origin = request.headers.get("origin")
-    if origin and "://" in origin:
-        origin_host = origin.split("://", 1)[1].split("/")[0].rsplit(":", 1)[0].strip().lower()
-        if origin_host and not _ALLOWED_HOST.match(origin_host):
-            return JSONResponse({"detail": "forbidden origin"}, status_code=403)
+    if origin and not _is_allowed_origin(origin):
+        return JSONResponse({"detail": "forbidden origin"}, status_code=403)
     return await call_next(request)
 
 # Global manager instance (Userspace tunnel for Windows/Linux, native tunnel for macOS)
 is_darwin = platform.system() == "Darwin"
-manager = CoreDeviceLocationManager(use_userspace=not is_darwin)
+manager = MultiDeviceManager(CoreDeviceLocationManager(use_userspace=not is_darwin))
+
+
+@app.on_event("shutdown")
+async def shutdown_multi_device_event():
+    """优雅关闭：关停所有设备 worker 子进程并释放全部设备会话。"""
+    try:
+        await manager.shutdown()
+    except Exception as e:
+        logger.warning(f"manager shutdown notice: {e}")
 
 
 class SimulateLocationRequest(BaseModel):
     udid: Optional[str] = Field(None, description="Device UDID (optional if single device)")
-    latitude: float = Field(..., ge=-90.0, le=90.0, description="Latitude in decimal degrees")
-    longitude: float = Field(..., ge=-180.0, le=180.0, description="Longitude in decimal degrees")
+    latitude: float = Field(
+        ..., ge=-90.0, le=90.0, allow_inf_nan=False,
+        description="Latitude in decimal degrees",
+    )
+    longitude: float = Field(
+        ..., ge=-180.0, le=180.0, allow_inf_nan=False,
+        description="Longitude in decimal degrees",
+    )
 
 
 class ClearLocationRequest(BaseModel):
     udid: Optional[str] = Field(None, description="Device UDID (optional if single device)")
+
+
+class BatchSimulateItem(BaseModel):
+    udid: str = Field(..., min_length=1, max_length=128, description="Target device UDID (required per item)")
+    latitude: float = Field(
+        ..., ge=-90.0, le=90.0, allow_inf_nan=False,
+        description="Latitude in decimal degrees",
+    )
+    longitude: float = Field(
+        ..., ge=-180.0, le=180.0, allow_inf_nan=False,
+        description="Longitude in decimal degrees",
+    )
+
+
+class BatchSimulateLocationRequest(BaseModel):
+    items: List[BatchSimulateItem] = Field(
+        ..., min_length=1, max_length=16,
+        description="Per-device items; each device is authorized and reported independently",
+    )
 
 
 class DisconnectDeviceRequest(BaseModel):
@@ -127,21 +237,28 @@ class ConnectorAuthConfigureRequest(BaseModel):
 @app.get("/health")
 @app.get("/api/health")
 async def health_check():
+    caps = ["cloud-auth", "multi-device"]
     return {
         "status": "healthy",
         "service": "LocalWarp Connector",
         "version": VERSION,
         "platform": platform.system(),
         "arch": platform.machine(),
-        # v1.1.0 起：声明支持云端权益授权，网页据此决定是否允许定位写入
-        "capabilities": ["cloud-auth"]
+        "capabilities": caps,
+        # 多设备后端状态：mode = native-parallel（macOS）| worker-routed
+        #（Windows/Linux，额外设备走独立 worker 进程）；供前端能力探测与诊断
+        "multi_device": manager.multi_device_status(),
     }
 
 
 @app.post("/api/auth/configure")
 async def configure_connector_auth(req: ConnectorAuthConfigureRequest):
-    """网页配对入口：保存受限令牌（仅内存）并立即向云端确认一次。"""
-    ok, detail = cloud_authorizer.configure(req.token, req.cloud_url, req.udid)
+    """网页配对入口：保存受限令牌（仅内存）并立即向云端确认一次。
+
+    多设备：每台 iPhone 必须用「自己 deviceHash 签发的 token + 自己的 udid」
+    各调用一次（逐设备配对）；旧版不带 udid 的调用仍兼容（单设备语义）。
+    云端确认放到线程池执行，不阻塞事件循环。"""
+    ok, detail = await cloud_authorizer.configure_async(req.token, req.cloud_url, req.udid)
     if not ok:
         raise HTTPException(status_code=400, detail=detail)
     return {"success": True, "message": "Connector authorized (memory only, cleared on restart)"}
@@ -152,7 +269,9 @@ async def connector_auth_status():
     return {
         "paired": cloud_authorizer.is_paired,
         "version": VERSION,
-        "capabilities": ["cloud-auth"],
+        "capabilities": ["cloud-auth", "multi-device"],
+        # 已按 UDID 独立配对的设备（不含旧版共享凭证）
+        "paired_udids": cloud_authorizer.paired_udids(),
     }
 
 
@@ -175,8 +294,9 @@ async def list_devices():
 @app.post("/api/location/simulate")
 async def simulate_location(req: SimulateLocationRequest):
     # 云端权益门禁：缓存命中时零开销；到期/未配对/云端不可达一律拒绝写入。
+    # 异步版：云端复核在线程池执行，绝不冻结事件循环（否则会卡住所有设备的写入）。
     # 恢复真实定位（/api/location/clear）不受此限制。
-    ok, reason = cloud_authorizer.ensure_authorized(req.udid or "")
+    ok, reason = await cloud_authorizer.ensure_authorized_async(req.udid or "")
     if not ok:
         logger.warning(f"Simulate denied by cloud authorization: {reason}")
         raise HTTPException(status_code=403, detail=reason)
@@ -195,6 +315,37 @@ async def simulate_location(req: SimulateLocationRequest):
     except Exception as e:
         logger.error(f"Failed to set location: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/location/simulate_batch")
+async def simulate_location_batch(req: BatchSimulateLocationRequest):
+    """批量写入：逐设备授权、逐项返回；一台失败不影响其它设备。
+
+    - 每项必须携带显式 udid（批量语境下不允许回退单设备语义，防止串写其它设备）。
+    - 授权与写入均为逐项独立：被拒的设备返回 403 原因，其余照常执行。
+    """
+    async def _run_one(item: BatchSimulateItem) -> Dict:
+        try:
+            ok, reason = await cloud_authorizer.ensure_authorized_async(item.udid)
+            if not ok:
+                logger.warning(f"Batch simulate denied for {item.udid}: {reason}")
+                return {"udid": item.udid, "success": False, "error": reason}
+            result = await manager.simulate_location(
+                latitude=item.latitude, longitude=item.longitude, udid=item.udid
+            )
+            return {"udid": item.udid, "success": True, "data": result}
+        except Exception as e:
+            return {"udid": item.udid, "success": False, "error": str(e)}
+
+    results = list(await asyncio.gather(*(_run_one(item) for item in req.items)))
+    succeeded = sum(1 for r in results if r.get("success"))
+    failed = len(results) - succeeded
+    return {
+        "success": failed == 0,
+        "partial_success": 0 < succeeded < len(results),
+        "summary": {"total": len(results), "succeeded": succeeded, "failed": failed},
+        "results": results,
+    }
 
 
 @app.post("/api/location/clear")
@@ -469,16 +620,36 @@ def print_windows_amds_warning():
 # ==============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="LocalWarp Connector: Secure local iOS Location daemon for Web Studio"
-    )
-    parser.add_argument("--host", default="0.0.0.0", help="Binding host (default: 0.0.0.0)")
-    parser.add_argument("--port", type=int, default=28888, help="Listening port (default: 28888)")
-    parser.add_argument("--status", action="store_true", help="Check current daemon status and list devices")
-    parser.add_argument("--install-service", action="store_true", help="Install as persistent auto-start system service")
-    parser.add_argument("--uninstall-service", action="store_true", help="Uninstall auto-start system service")
-    
+    # 设备 worker 模式（由主连接器或 PyInstaller 运行时钩子拉起）：
+    # 直接进入 worker 循环，不启动 HTTP 服务器
+    _worker_udid = os.environ.get("LOCALWARP_DEVICE_WORKER_UDID")
+    if _worker_udid:
+        from multi_device import run_worker
+        _port = os.environ.get("LOCALWARP_WORKER_IPC_PORT")
+        _auth = os.environ.get("LOCALWARP_WORKER_IPC_AUTH")
+
+        sys.exit(
+            run_worker(
+                _worker_udid,
+                fake=os.environ.get("LOCALWARP_DEVICE_WORKER_FAKE") == "1",
+                ipc_port=int(_port) if _port else None,
+                ipc_auth=_auth,
+            )
+        )
+
+    parser = build_argument_parser()
     args = parser.parse_args()
+
+    w_udid = args.worker_udid or args.udid
+    if (args.device_worker or args.worker) and w_udid:
+        from multi_device import run_worker
+
+        sys.exit(run_worker(
+            w_udid,
+            fake=(args.worker_fake or args.fake),
+            ipc_port=args.ipc_port,
+            ipc_auth=args.ipc_auth,
+        ))
     
     if args.install_service:
         sys.exit(0 if install_service() else 1)
@@ -492,7 +663,7 @@ def main():
         print("[*] Checking LocalWarp Connector status...")
         import urllib.request
         import json
-        # Windows 上 0.0.0.0 不是回环地址，状态探测固定走 127.0.0.1
+        # 0.0.0.0 is a bind address, not a usable destination for status checks.
         probe_host = "127.0.0.1" if args.host in ("0.0.0.0", "::", "") else args.host
         try:
             req = urllib.request.Request(f"http://{probe_host}:{args.port}/health")
@@ -500,8 +671,8 @@ def main():
                 data = json.loads(resp.read().decode())
                 print(f"[+] Connector is ONLINE: {data}")
             req_dev = urllib.request.Request(f"http://{probe_host}:{args.port}/api/devices")
-            # /api/devices 最坏路径（native browse 1.8s + 未配对设备 2s 配对等待）可超 3s，
-            # 预算须覆盖，否则明明 ONLINE 却误报 OFFLINE
+            # Device discovery can wait for a pairing prompt, so allow it longer
+            # than the quick health probe to avoid reporting a false offline state.
             with urllib.request.urlopen(req_dev, timeout=8) as resp_dev:
                 devices = json.loads(resp_dev.read().decode()).get("devices", [])
                 print(f"[+] Connected iOS Devices ({len(devices)}):")
@@ -512,9 +683,32 @@ def main():
         return
 
     print_banner(args.host, args.port)
-    
-    # Run uvicorn server directly with app object (PyInstaller safe)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info", access_log=False)
+
+
+def build_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="LocalWarp Connector: Secure local iOS Location daemon for Web Studio"
+    )
+    parser.add_argument(
+        "--host",
+        default=DEFAULT_HOST,
+        type=_validate_loopback_bind_host,
+        help=f"Loopback binding host (default: {DEFAULT_HOST}; non-loopback addresses are rejected)",
+    )
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Listening port (default: {DEFAULT_PORT})")
+    parser.add_argument("--status", action="store_true", help="Check current daemon status and list devices")
+    parser.add_argument("--install-service", action="store_true", help="Install as persistent auto-start system service")
+    parser.add_argument("--uninstall-service", action="store_true", help="Uninstall auto-start system service")
+    parser.add_argument("--device-worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--worker-udid", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--udid", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-fake", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--fake", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--ipc-port", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--ipc-auth", type=str, default=None, help=argparse.SUPPRESS)
+    return parser
 
 
 if __name__ == "__main__":

@@ -20,9 +20,37 @@ import threading
 import time
 import webbrowser
 
-DEFAULT_HOST = "0.0.0.0"
+DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 28888
 WORKBENCH_URL = "https://localwarp.com/app"
+
+
+def check_and_run_worker() -> None:
+    """Windows GUI 入口（PyInstaller --noconsole）：
+    在单实例检测与托盘启动之前，必须优先拦截并执行 worker 模式。
+    --noconsole 下无控制台，避免触发 GUI 或单实例探测退出。"""
+    udid = os.environ.get("LOCALWARP_DEVICE_WORKER_UDID")
+    fake = os.environ.get("LOCALWARP_DEVICE_WORKER_FAKE") == "1"
+    ipc_port = os.environ.get("LOCALWARP_WORKER_IPC_PORT")
+    ipc_auth = os.environ.get("LOCALWARP_WORKER_IPC_AUTH")
+    if not udid:
+        for i, a in enumerate(sys.argv):
+            if a in ("--worker", "--device-worker"):
+                for j, b in enumerate(sys.argv):
+                    if b in ("--udid", "--worker-udid") and j + 1 < len(sys.argv):
+                        udid = sys.argv[j + 1]
+                    if b in ("--fake", "--worker-fake"):
+                        fake = True
+                    if b == "--ipc-port" and j + 1 < len(sys.argv):
+                        ipc_port = sys.argv[j + 1]
+                    if b == "--ipc-auth" and j + 1 < len(sys.argv):
+                        ipc_auth = sys.argv[j + 1]
+                break
+    if udid:
+        from multi_device import run_worker
+        port_num = int(ipc_port) if ipc_port else None
+        rc = run_worker(udid, fake=fake, ipc_port=port_num, ipc_auth=ipc_auth)
+        sys.exit(rc if isinstance(rc, int) else 0)
 
 
 def get_log_path() -> str:
@@ -125,12 +153,17 @@ def run_tray(server, server_thread, started: bool, port: int, log_path: str):
     def quit_app(icon=None, item=None):
         log.info("Quit requested from tray")
         server.should_exit = True
-        # 给进行中的请求/隧道操作留出收尾时间，并确保日志落盘
-        server_thread.join(timeout=8)
-        logging.shutdown()
+        # 给进行中的请求/隧道操作与 worker 子进程留出充裕收尾时间（对齐 worker aclose 2s+5s+5s + inproc 清理），
+        # 正常退出优先通过 icon.stop() 让主线程自然返回，仅当线程超时仍未结束时才兜底强退。
+        server_thread.join(timeout=20.0)
+        still_alive = server_thread.is_alive()
+        if still_alive:
+            log.warning("Server thread did not finish within 20s timeout; forcing process exit.")
         if icon:
             icon.stop()
-        os._exit(0)
+        logging.shutdown()
+        if still_alive:
+            os._exit(0)
 
     tooltip = (
         f"LocalWarp 连接器 · 运行中 :{port}"
@@ -158,13 +191,59 @@ def run_tray(server, server_thread, started: bool, port: int, log_path: str):
     icon.run()
 
 
-def main():
+def _validate_loopback_bind_host(value: str) -> str:
+    import ipaddress
+
+    candidate = (value or "").strip()
+    if candidate.startswith("[") and candidate.endswith("]"):
+        candidate = candidate[1:-1]
+    normalized = candidate.rstrip(".").lower()
+    if normalized == "localhost":
+        return candidate
+    try:
+        addr = ipaddress.ip_address(normalized)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"Connector must bind to a loopback address (e.g. 127.0.0.1, ::1, or localhost); got {value!r}"
+        ) from exc
+    if not addr.is_loopback:
+        raise argparse.ArgumentTypeError(
+            f"Connector must bind to a loopback address (e.g. 127.0.0.1, ::1, or localhost); got {value!r}"
+        )
+    return candidate
+
+
+def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="LocalWarp Connector (Tray GUI)")
-    parser.add_argument("--host", default=DEFAULT_HOST)
+    parser.add_argument(
+        "--host",
+        default=DEFAULT_HOST,
+        type=_validate_loopback_bind_host,
+        help=f"Loopback binding host (default: {DEFAULT_HOST}; non-loopback addresses are rejected)",
+    )
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--no-tray", action="store_true",
                         help="Run headless without tray icon (testing / non-Windows)")
-    args = parser.parse_args()
+    parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--device-worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--udid", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-udid", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--fake", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--worker-fake", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--ipc-port", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--ipc-auth", type=str, default=None, help=argparse.SUPPRESS)
+    return parser
+
+
+def main():
+    check_and_run_worker()
+    args = build_argument_parser().parse_args()
+
+    # Double check if worker arguments passed via parsed args
+    w_udid = args.udid or args.worker_udid
+    if (args.worker or args.device_worker) and w_udid:
+        from multi_device import run_worker
+        sys.exit(run_worker(w_udid, fake=(args.fake or args.worker_fake), ipc_port=args.ipc_port, ipc_auth=args.ipc_auth))
 
     log_path = setup_file_logging()
     log = logging.getLogger("localwarp.gui")
@@ -196,9 +275,12 @@ def main():
                 time.sleep(3600)
         except KeyboardInterrupt:
             server.should_exit = True
+            server_thread.join(timeout=20.0)
+            logging.shutdown()
     else:
         run_tray(server, server_thread, started, args.port, log_path)
 
 
 if __name__ == "__main__":
+    check_and_run_worker()
     main()

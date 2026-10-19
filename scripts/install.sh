@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# LocalWarp Connector: Universal Unix One-Line Installer (macOS & Linux)
+# LocalWarp Connector: macOS One-Line Installer
 # Install:   curl -fsSL https://localwarp.com/install.sh | bash
 # Uninstall: curl -fsSL https://localwarp.com/install.sh | bash -s uninstall
 # ==============================================================================
@@ -16,7 +16,7 @@ SERVICE_FILE="${HOME}/.config/systemd/user/${SERVICE_NAME}.service"
 
 do_uninstall() {
     echo "=================================================="
-    echo "    LocalWarp Connector Uninstall (macOS/Linux)   "
+    echo "    LocalWarp Connector Uninstall                "
     echo "=================================================="
     OS="$(uname -s)"
     if [ "${OS}" = "Darwin" ]; then
@@ -57,7 +57,8 @@ case "${OS}" in
         PLATFORM="macos"
         ;;
     Linux)
-        PLATFORM="linux"
+        echo "[-] Linux is not supported yet. Please use Windows or macOS."
+        exit 1
         ;;
     *)
         echo "[-] Unsupported operating system: ${OS}"
@@ -81,43 +82,63 @@ esac
 
 echo "[+] Detected: ${PLATFORM} (${MACHINE})"
 
-# CI 只产出 linux-x64：arm64 Linux 明确提示，避免下载必然失败的产物
-if [ "${PLATFORM}" = "linux" ] && [ "${MACHINE}" = "arm64" ]; then
-    echo "[-] Linux arm64 暂无官方构建。请在 x86_64 Linux 上使用，或克隆仓库自行运行 scripts/build_connector.py 构建。"
-    exit 1
-fi
-
 mkdir -p "${INSTALL_DIR}"
 
 DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/LocalWarp-Connector-${PLATFORM}-${MACHINE}"
 
+# Stage in the destination directory, then rename atomically. Writing directly
+# over a running executable can fail or damage the installed version.
+STAGED_BINARY="$(mktemp "${INSTALL_DIR}/.localwarp-connector.XXXXXX")"
+trap 'rm -f "${STAGED_BINARY}"' EXIT
+
 echo "[*] Downloading standalone LocalWarp Connector binary..."
-# Fallback to local build if available in dev environment
-# （curl | bash 管道态下 BASH_SOURCE 为空，此时必须跳过本地构建回退）
 LOCAL_DEV_BUILD=""
 if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
     LOCAL_DEV_BUILD="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)/dist/connectors/LocalWarp-Connector-${PLATFORM}-${MACHINE}"
 fi
-if [ -n "${LOCAL_DEV_BUILD}" ] && [ -f "${LOCAL_DEV_BUILD}" ]; then
-    echo "[+] Using local build: ${LOCAL_DEV_BUILD}"
-    cp "${LOCAL_DEV_BUILD}" "${TARGET_PATH}"
-else
+
+DOWNLOAD_OK=0
+if [ "${LOCALWARP_USE_LOCAL_BUILD:-0}" != "1" ]; then
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "${DOWNLOAD_URL}" -o "${TARGET_PATH}" || {
-            rm -f "${TARGET_PATH}"
-            echo "[-] Download from GitHub Releases failed or release not yet published."
-            exit 1
-        }
-    else
-        wget -qO "${TARGET_PATH}" "${DOWNLOAD_URL}" || {
-            rm -f "${TARGET_PATH}"
-            echo "[-] Download from GitHub Releases failed or release not yet published."
-            exit 1
-        }
+        if curl -fsSL "${DOWNLOAD_URL}" -o "${STAGED_BINARY}" 2>/dev/null; then
+            DOWNLOAD_OK=1
+        fi
+    elif command -v wget >/dev/null 2>&1; then
+        if wget -qO "${STAGED_BINARY}" "${DOWNLOAD_URL}" 2>/dev/null; then
+            DOWNLOAD_OK=1
+        fi
     fi
 fi
 
-chmod +x "${TARGET_PATH}"
+if [ "${DOWNLOAD_OK}" -eq 0 ]; then
+    if [ -n "${LOCAL_DEV_BUILD}" ] && [ -f "${LOCAL_DEV_BUILD}" ]; then
+        echo "[+] Falling back to local build: ${LOCAL_DEV_BUILD}"
+        cp "${LOCAL_DEV_BUILD}" "${STAGED_BINARY}"
+    else
+        echo "[-] Download from GitHub Releases failed or release not yet published."
+        exit 1
+    fi
+fi
+
+if [ -n "${LOCALWARP_EXPECTED_SHA256:-}" ]; then
+    if command -v shasum >/dev/null 2>&1; then
+        ACTUAL_SHA256="$(shasum -a 256 "${STAGED_BINARY}" | awk '{print $1}')"
+    elif command -v sha256sum >/dev/null 2>&1; then
+        ACTUAL_SHA256="$(sha256sum "${STAGED_BINARY}" | awk '{print $1}')"
+    else
+        echo "[-] Neither shasum nor sha256sum available to verify LOCALWARP_EXPECTED_SHA256."
+        exit 1
+    fi
+    if [ "${ACTUAL_SHA256}" != "${LOCALWARP_EXPECTED_SHA256}" ]; then
+        echo "[-] SHA-256 mismatch! Expected ${LOCALWARP_EXPECTED_SHA256}, got ${ACTUAL_SHA256}"
+        exit 1
+    fi
+    echo "[+] Verified binary SHA-256: ${ACTUAL_SHA256}"
+fi
+
+chmod +x "${STAGED_BINARY}"
+mv -f "${STAGED_BINARY}" "${TARGET_PATH}"
+trap - EXIT
 echo "[+] Binary installed to: ${TARGET_PATH}"
 
 # Service auto-start registration
@@ -154,26 +175,6 @@ EOF
         || launchctl load "${PLIST}" 2>/dev/null \
         || echo "[-] 自动启动服务失败，请手动执行: launchctl load ${PLIST}"
     echo "[+] macOS launchd service configured and started!"
-elif [ "${PLATFORM}" = "linux" ]; then
-    SYSTEMD_DIR="${HOME}/.config/systemd/user"
-    mkdir -p "${SYSTEMD_DIR}"
-    cat <<EOF > "${SERVICE_FILE}"
-[Unit]
-Description=LocalWarp iPhone Location Connector Daemon
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=${TARGET_PATH}
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=default.target
-EOF
-    systemctl --user daemon-reload 2>/dev/null || true
-    systemctl --user enable --now "${SERVICE_NAME}.service" 2>/dev/null || true
-    echo "[+] Linux systemd user service configured and started!"
 fi
 
 # Health check

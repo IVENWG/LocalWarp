@@ -1,0 +1,3 @@
+# Connector release build tool. Keep this in sync with PYINSTALLER_VERSION in
+# scripts/build_connector.py so local and CI artifacts use the same freezer.
+pyinstaller==6.22.3

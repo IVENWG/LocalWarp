@@ -23,7 +23,9 @@ import os
 import argparse
 import asyncio
 import logging
-from typing import List, Dict, Any, Optional
+import math
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
 # pymobiledevice3 以 pip 安装版为准（与 CI 打包环境一致）；vendored 副本仅作未安装时的兜底，
 # append 到搜索路径末尾，保证 pip 版存在时永远优先于 vendored 版
@@ -38,8 +40,104 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("CoreDeviceLocationPoC")
 
 
+def _validate_location_coordinates(latitude: Any, longitude: Any) -> tuple[float, float]:
+    """Validate public location inputs before opening or reusing a device session."""
+    if (not isinstance(latitude, (int, float)) or isinstance(latitude, bool)
+            or not isinstance(longitude, (int, float)) or isinstance(longitude, bool)):
+        raise ValueError("latitude and longitude must be numeric coordinates")
+    try:
+        lat = float(latitude)
+        lon = float(longitude)
+    except OverflowError as exc:
+        raise ValueError("latitude and longitude must be finite numbers") from exc
+    if not math.isfinite(lat) or not math.isfinite(lon):
+        raise ValueError("latitude and longitude must be finite numbers")
+    if not -90.0 <= lat <= 90.0:
+        raise ValueError("latitude must be between -90 and 90 degrees")
+    if not -180.0 <= lon <= 180.0:
+        raise ValueError("longitude must be between -180 and 180 degrees")
+    return lat, lon
+
+
 class DeveloperModeDisabledError(RuntimeError):
     """iPhone 未开启开发者模式：确定性错误，重建会话无济于事，须原样透传给前端引导。"""
+
+
+class UserspaceSlotBusyError(RuntimeError):
+    """进程内 userspace 隧道单例已被其它设备占用（仅 darwin 原生回退路径抛出）。
+
+    多设备路由层（src/backend/multi_device.py）捕获本错误后把该设备分流到独立
+    worker 进程重试，保证「设备 B 建链绝不驱逐设备 A」。
+    """
+
+
+class PerDeviceLocks:
+    """按设备 UDID 独立的 asyncio 锁集合（多设备并行的基础）。
+
+    - 不同 key 互不阻塞：写设备 A 不再等设备 B 的隧道操作
+    - 同 key 严格串行：同设备的写入/清理/断开顺序正确
+    - 同一 task 持有 key 锁时再次申请同锁：立即 RuntimeError 快速失败，
+      而不是 asyncio.Lock 默认的静默死锁
+    - 资源有界：引用计数归零的空闲锁可被回收；活跃 key 数量超过
+      MAX_KEYS（纯工程护栏，非商业设备限制）时拒绝新 key
+    """
+
+    MAX_KEYS = 64
+
+    def __init__(self, max_keys: Optional[int] = None):
+        self.max_keys = max_keys or self.MAX_KEYS
+        self._locks: Dict[str, asyncio.Lock] = {}
+        self._owners: Dict[str, Optional[asyncio.Task]] = {}
+        # 引用在 acquire() 入口同步递增、在 finally 归零：rc==0 意味着既无
+        # 持有者也无等待者，对应的锁对象可以安全从字典移除（事件循环内原子）
+        self._refcounts: Dict[str, int] = {}
+
+    @asynccontextmanager
+    async def acquire(self, key: str) -> AsyncIterator[None]:
+        lock = self._locks.get(key)
+        if lock is None:
+            if len(self._locks) >= self.max_keys:
+                self.prune_idle()
+                if len(self._locks) >= self.max_keys:
+                    raise RuntimeError(
+                        f"too many distinct device keys (resource limit {self.max_keys})"
+                    )
+            lock = self._locks[key] = asyncio.Lock()
+        self._refcounts[key] = self._refcounts.get(key, 0) + 1
+        task = asyncio.current_task()
+        if self._owners.get(key) is task and lock.locked():
+            self._refcounts[key] -= 1
+            raise RuntimeError(
+                f"Recursive lock acquisition detected for device '{key}'; "
+                "this would deadlock and indicates a caller bug"
+            )
+        try:
+            async with lock:
+                self._owners[key] = task
+                try:
+                    yield
+                finally:
+                    if self._owners.get(key) is task:
+                        self._owners[key] = None
+        finally:
+            self._refcounts[key] -= 1
+            if self._refcounts[key] <= 0:
+                self._refcounts.pop(key, None)
+
+    def prune_idle(self, key: Optional[str] = None) -> None:
+        """回收无持有者且无等待者的锁对象；指定 key 时仅尝试该 key。"""
+        candidates = [key] if key is not None else list(self._locks.keys())
+        for k in candidates:
+            if k in self._locks and self._refcounts.get(k, 0) == 0:
+                self._locks.pop(k, None)
+                self._owners.pop(k, None)
+                self._refcounts.pop(k, None)
+
+    def active_key_count(self) -> int:
+        return len(self._locks)
+
+    def all_keys(self) -> List[str]:
+        return list(self._locks.keys())
 
 
 # 单次定位写入全链路（devmode 查询 + connect + invoke + 回退链）的超时预算。
@@ -56,10 +154,14 @@ class CoreDeviceLocationClient:
     ACTION_CLEAR = "com.apple.coredevice.action.clearsimulatedlocation"
     FEATURE_LOCATION = "com.apple.coredevice.feature.simulatelocation"
 
-    def __init__(self, rsd: RemoteServiceDiscoveryService, tunnel: Optional[Any] = None):
+    def __init__(self, rsd: RemoteServiceDiscoveryService, tunnel: Optional[Any] = None,
+                 tunnel_kind: Optional[str] = None):
         self.rsd = rsd
         # 持有隧道句柄：请求结束后由 manager aclose，连带释放 RSD 连接与隧道本体
         self.tunnel = tunnel
+        # "native"（macOS remoted 托管，天然多设备并行）/ "userspace"（进程级
+        # PyTCP 单例，同进程同时至多一个）——驱逐/槽位管理按此判别
+        self.tunnel_kind = tunnel_kind
         self.service = CoreDeviceService(rsd, self.SERVICE_NAME)
         # 会话内已确认开发者模式开启：避免巡航 10Hz 下每次写入都多一趟远端查询
         self._dev_mode_verified = False
@@ -69,6 +171,8 @@ class CoreDeviceLocationClient:
         Set simulated location with {latitude: double, longitude: double} flat payload.
         Supports CoreDevice LocationService with automatic fallback to DtSimulateLocation and auto_mount.
         """
+        latitude, longitude = _validate_location_coordinates(latitude, longitude)
+
         # 1. Check Developer Mode status first（会话内只查一次，查询不可用时也不再重试刷日志）
         if not self._dev_mode_verified and hasattr(self.rsd, "get_developer_mode_status"):
             try:
@@ -225,7 +329,18 @@ class CoreDeviceLocationManager:
     def __init__(self, use_userspace: bool = False):
         self.use_userspace = use_userspace
         self.active_clients: Dict[str, CoreDeviceLocationClient] = {}
-        self._lock = asyncio.Lock()
+        # 按 UDID 独立的锁：不同设备写入互不等待；同设备写入/清理/断开串行
+        self._locks = PerDeviceLocks()
+        # 进程内 userspace（PyTCP 栈）单例槽位的当前占用者 UDID；None = 空闲。
+        # native 隧道不受此槽位约束（由系统 remoted 托管，天然多设备并行）。
+        self._userspace_slot: Optional[str] = None
+        # shutdown 后置位：新请求立即失败，不再悄悄创建会话
+        self._closed = False
+
+    @property
+    def userspace_slot_holder(self) -> Optional[str]:
+        """当前占用进程内 userspace 隧道单例的设备 UDID（供多设备路由层决策）。"""
+        return self._userspace_slot
 
     async def list_devices(self) -> List[Dict[str, Any]]:
         """
@@ -378,7 +493,7 @@ class CoreDeviceLocationManager:
 
         return devices
 
-    async def _create_client(self, device_id: Optional[str] = None) -> CoreDeviceLocationClient:
+    async def _create_client(self, device_id: Optional[str] = None, create_key: Optional[str] = None) -> CoreDeviceLocationClient:
         logger.info(f"Establishing clean RSD connection for device: {device_id or 'default'} (userspace={self.use_userspace})")
         tunnel = None
         if self.use_userspace or sys.platform != "darwin":
@@ -391,17 +506,26 @@ class CoreDeviceLocationManager:
             except Exception as e:
                 if "already active" not in str(e):
                     raise
-                # PyTCP 栈是进程级单例：设备 A 的会话常驻会让设备 B 永远建不了隧道。
-                # 语义定为「后请求的设备优先」——断开全部现有会话让位后重试一次
+                # PyTCP 栈是进程级单例：同进程内另一台设备的会话常驻时，本设备建不了隧道。
+                # 驱逐范围严格限定为「同样经由 userspace 隧道建立的会话」（多设备路由下
+                # 至多一个），native 隧道会话（macOS remoted 托管）绝不受牵连。
+                # 正常多设备流量在到达此处之前已被上层路由分流到独立 worker 进程，
+                # 这里只保留单进程直用（CLI / 旧单设备语义）时的「后请求者让位重试」。
                 logger.warning(f"Userspace tunnel singleton held by another device session; evicting ({e})")
                 for k in list(self.active_clients):
-                    await self.disconnect_device(k)
+                    if k == create_key:
+                        continue  # 绝不驱逐正在创建中的目标设备自身（避免递归申请同锁）
+                    victim = self.active_clients.get(k)
+                    if victim is not None and getattr(victim, "tunnel_kind", None) == "userspace":
+                        # 其它设备：走 public 断开（与其在飞操作串行，不抽走在飞隧道）
+                        await self.disconnect_device(k)
                 try:
                     await tunnel.aclose()
                 except Exception:
                     pass
                 tunnel = UserspaceRsdTunnel(serial=device_id)
                 rsd = await asyncio.wait_for(tunnel.aopen(), timeout=8.0)
+            return CoreDeviceLocationClient(rsd, tunnel=tunnel, tunnel_kind="userspace")
         else:
             try:
                 from pymobiledevice3.remote.native_tunnel import NativeRemotedTunnel
@@ -409,6 +533,8 @@ class CoreDeviceLocationManager:
                 # native 建链内部含最长 ~10s 的 browse + XPC 等待；超时取消会留下收不了尾的
                 # 孤儿线程（asyncio.to_thread 取消不掉），所以预算给足 20s，只兜真正的挂死
                 rsd = await asyncio.wait_for(tunnel.aopen(), timeout=20.0)
+                # native 隧道由系统 remoted 托管，不同 UDID 各自独立——绝无驱逐语义
+                return CoreDeviceLocationClient(rsd, tunnel=tunnel, tunnel_kind="native")
             except Exception as e:
                 logger.warning(f"Native tunnel failed: {e}. Falling back to userspace tunnel...")
                 if tunnel is not None:
@@ -418,47 +544,82 @@ class CoreDeviceLocationManager:
                         pass
                 from pymobiledevice3.remote.userspace_tunnel import UserspaceRsdTunnel
                 tunnel = UserspaceRsdTunnel(serial=device_id)
-                rsd = await asyncio.wait_for(tunnel.aopen(), timeout=8.0)
-
-        client = CoreDeviceLocationClient(rsd, tunnel=tunnel)
-        return client
+                try:
+                    rsd = await asyncio.wait_for(tunnel.aopen(), timeout=8.0)
+                except Exception as ue:
+                    if "already active" in str(ue):
+                        # darwin 回退路径绝不允许驱逐其它设备（可能是 native 会话的所有者）。
+                        # 抛出可识别错误让上层路由把本设备分流到独立 worker 进程。
+                        logger.warning(
+                            f"Userspace fallback for {device_id or 'default'} blocked: in-process slot busy"
+                        )
+                        try:
+                            await tunnel.aclose()
+                        except Exception:
+                            pass
+                        raise UserspaceSlotBusyError(
+                            "userspace tunnel slot in this process is held by another device"
+                        ) from ue
+                    raise
+                return CoreDeviceLocationClient(rsd, tunnel=tunnel, tunnel_kind="userspace")
 
     async def _create_client_checked(self, device_id: Optional[str], key: str) -> CoreDeviceLocationClient:
         """_create_client 的门面：建链失败时把「设备不在线」翻译成可引导的中文错误并缓存新会话。"""
+        if self._closed:
+            raise RuntimeError("manager 已关闭：连接器正在退出，不再建立新会话")
+        client = None
         try:
-            client = await self._create_client(device_id)
-        except Exception as e:
-            if "no device matching" in str(e).lower():
+            client = await self._create_client(device_id, create_key=key)
+            if self._closed:
+                if getattr(client, "tunnel", None) is not None:
+                    await client.tunnel.aclose()
+                elif getattr(client, "rsd", None) is not None:
+                    await client.rsd.close()
+                raise RuntimeError("manager 已关闭：连接器正在退出，会话已撤销")
+            self.active_clients[key] = client
+            if getattr(client, "tunnel_kind", None) == "userspace":
+                self._userspace_slot = key
+            return client
+        except BaseException as e:
+            if client is not None and key not in self.active_clients:
+                try:
+                    if getattr(client, "tunnel", None) is not None:
+                        await client.tunnel.aclose()
+                    elif getattr(client, "rsd", None) is not None:
+                        await client.rsd.close()
+                except Exception:
+                    pass
+            if isinstance(e, Exception) and "no device matching" in str(e).lower():
                 raise RuntimeError(
                     "iPhone 当前不在线：请确认手机已开机、解锁，并与本机处于同一 Wi-Fi（或改用数据线连接）后重试。"
                 ) from e
             raise
-        self.active_clients[key] = client
-        return client
 
-    async def set_location(self, device_id: Optional[str], latitude: float, longitude: float) -> Dict[str, Any]:
+    async def _run_device_op(self, key: str, device_id: Optional[str], invoke) -> Dict[str, Any]:
+        """单设备操作的统一执行器：per-UDID 锁 + 会话复用 + 失活重建 + DDI 自动挂载。
+
+        - 锁粒度是 key（设备 UDID）：设备 A 的慢操作（建链/挂载/重试）只阻塞设备 A，
+          不再冻结其它设备的写入。
+        - 会话失活（Errno 65 / 设备重启 / 写入超时）时丢弃重建并重试一次。
+        - "No such service"（DDI 未挂载）时借当前 RSD 会话挂载镜像后换新会话重试。
+        - 最终失败（含取消）：只丢弃该设备自己的会话，其它设备不受牵连。
         """
-        Set target latitude and longitude on device.
-        会话常驻复用：首次调用建立隧道并缓存在 active_clients，后续调用直接复用，
-        把巡航/摇杆高频写入从「每次整链重建 ~1.6s」降到单次服务调用的亚秒级；
-        会话失活（Errno 65 / 设备重启 / 服务缺失 / 写入超时）时丢弃重建并重试一次。
-        """
-        async with self._lock:
-            key = device_id or "default"
+        async with self._locks.acquire(key):
+            if self._closed:
+                raise RuntimeError("manager已关闭：连接器正在退出，不再接受定位操作")
             client = self.active_clients.get(key)
             if client is None:
                 client = await self._create_client_checked(device_id, key)
+            if self._closed:
+                raise RuntimeError("manager已关闭：连接器正在退出，不再接受定位操作")
             try:
                 for attempt in (0, 1):  # 0=复用缓存会话, 1=丢弃重建后重试
                     if attempt == 1:
                         logger.warning(f"Rebuilding tunnel session for {key}...")
-                        await self.disconnect_device(key)
+                        await self._disconnect_device_unlocked(key)
                         client = await self._create_client_checked(device_id, key)
                     try:
-                        result = await asyncio.wait_for(
-                            client.set_simulated_location(latitude, longitude), timeout=INVOKE_TIMEOUT_S
-                        )
-                        logger.info(f"Location successfully updated to lat={latitude}, lon={longitude}")
+                        result = await asyncio.wait_for(invoke(client), timeout=INVOKE_TIMEOUT_S)
                         return result
                     except Exception as e:
                         if isinstance(e, DeveloperModeDisabledError):
@@ -475,24 +636,37 @@ class CoreDeviceLocationManager:
                             except Exception:
                                 logger.warning(f"auto_mount failed on {key}; giving up this request")
                                 raise e
-                            await self.disconnect_device(key)
+                            await self._disconnect_device_unlocked(key)
                             client = await self._create_client_checked(device_id, key)
-                            result = await asyncio.wait_for(
-                                client.set_simulated_location(latitude, longitude), timeout=INVOKE_TIMEOUT_S
-                            )
-                            logger.info("Location successfully updated (DDI mounted, session rebuilt).")
+                            result = await asyncio.wait_for(invoke(client), timeout=INVOKE_TIMEOUT_S)
                             return result
                         if attempt == 0:
                             logger.warning(f"Reused session failed ({e}); rebuilding tunnel session...")
                             continue
                         raise
             except BaseException:
-                # 请求最终失败（含重试失败/超时/客户端取消）：丢弃会话，不给下次调用留坏句柄
+                # 请求最终失败（含重试失败/超时/客户端取消）：只丢弃该设备会话，不给下次调用留坏句柄
                 try:
-                    await self.disconnect_device(key)
+                    await self._disconnect_device_unlocked(key)
                 except Exception:
                     pass
                 raise
+
+    async def set_location(self, device_id: Optional[str], latitude: float, longitude: float) -> Dict[str, Any]:
+        """
+        Set target latitude and longitude on device.
+        会话常驻复用：首次调用建立隧道并缓存在 active_clients，后续调用直接复用，
+        把巡航/摇杆高频写入从「每次整链重建 ~1.6s」降到单次服务调用的亚秒级。
+        """
+        latitude, longitude = _validate_location_coordinates(latitude, longitude)
+        key = device_id or "default"
+
+        async def invoke(client):
+            result = await client.set_simulated_location(latitude, longitude)
+            logger.info(f"Location successfully updated to lat={latitude}, lon={longitude}")
+            return result
+
+        return await self._run_device_op(key, device_id, invoke)
 
     async def simulate_location(self, latitude: float, longitude: float, udid: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -505,52 +679,14 @@ class CoreDeviceLocationManager:
         Clear simulated location and restore real GPS（会话常驻复用，同 set_location）。
         """
         target_id = udid or device_id
-        async with self._lock:
-            key = target_id or "default"
-            client = self.active_clients.get(key)
-            if client is None:
-                client = await self._create_client_checked(target_id, key)
-            try:
-                for attempt in (0, 1):  # 0=复用缓存会话, 1=丢弃重建后重试
-                    if attempt == 1:
-                        logger.warning(f"Rebuilding tunnel session for {key}...")
-                        await self.disconnect_device(key)
-                        client = await self._create_client_checked(target_id, key)
-                    try:
-                        result = await asyncio.wait_for(
-                            client.clear_simulated_location(), timeout=INVOKE_TIMEOUT_S
-                        )
-                        logger.info("Location simulation successfully cleared.")
-                        return result
-                    except Exception as e:
-                        if isinstance(e, DeveloperModeDisabledError):
-                            raise
-                        if "No such service" in str(e):
-                            logger.info(f"Location service not active on {key}. Attempting auto_mount DDI...")
-                            try:
-                                from pymobiledevice3.services.mobile_image_mounter import auto_mount
-                                await asyncio.wait_for(auto_mount(client.rsd), timeout=MOUNT_TIMEOUT_S)
-                                logger.info("DDI mounted! Rebuilding session...")
-                            except Exception:
-                                logger.warning(f"auto_mount failed on {key}; giving up this request")
-                                raise e
-                            await self.disconnect_device(key)
-                            client = await self._create_client_checked(target_id, key)
-                            result = await asyncio.wait_for(
-                                client.clear_simulated_location(), timeout=INVOKE_TIMEOUT_S
-                            )
-                            logger.info("Location simulation successfully cleared (DDI mounted, session rebuilt).")
-                            return result
-                        if attempt == 0:
-                            logger.warning(f"Reused session failed ({e}); rebuilding tunnel session...")
-                            continue
-                        raise
-            except BaseException:
-                try:
-                    await self.disconnect_device(key)
-                except Exception:
-                    pass
-                raise
+        key = target_id or "default"
+
+        async def invoke(client):
+            result = await client.clear_simulated_location()
+            logger.info("Location simulation successfully cleared.")
+            return result
+
+        return await self._run_device_op(key, target_id, invoke)
 
     async def get_developer_mode_status(self, device_id: Optional[str] = None) -> Optional[bool]:
         """
@@ -699,7 +835,16 @@ class CoreDeviceLocationManager:
                 pass
 
     async def disconnect_device(self, device_id: str):
+        """Public 按设备断开：与 set/clear 同设备串行（per-UDID 锁），
+        不会在写入在飞时抽走它的隧道；其它设备的会话不受影响。"""
         key = device_id or "default"
+        async with self._locks.acquire(key):
+            await self._disconnect_device_unlocked(key)
+        self._locks.prune_idle(key)  # 无持有者/等待者时回收锁对象，防字典无界
+
+    async def _disconnect_device_unlocked(self, key: str):
+        """内部清理：调用方必须已持有 key 的设备锁（_run_device_op 重试/失败路径
+        与 shutdown 逐设备清理），绝不递归申请同锁。"""
         client = self.active_clients.pop(key, None)
         if client is not None:
             tunnel = getattr(client, "tunnel", None)
@@ -711,6 +856,22 @@ class CoreDeviceLocationManager:
                     await client.rsd.close()
             except Exception as e:
                 logger.debug(f"Tunnel teardown notice for {key}: {e}")
+            finally:
+                if self._userspace_slot == key:
+                    self._userspace_slot = None
+
+    async def shutdown(self):
+        """清理全部资源：先置 closed 拒绝新请求，再逐设备（与其在飞操作串行）
+        释放会话——关停不会与在飞写入竞争，关停后也不会再悄悄建新会话。"""
+        self._closed = True
+        keys_to_clean = set(self.active_clients.keys()) | set(self._locks.all_keys())
+        for key in keys_to_clean:
+            try:
+                async with self._locks.acquire(key):
+                    await self._disconnect_device_unlocked(key)
+            except Exception as e:
+                logger.debug(f"shutdown teardown notice for {key}: {e}")
+        self._locks.prune_idle()
 
 
 async def main():

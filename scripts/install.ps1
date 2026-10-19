@@ -15,6 +15,7 @@ $InstallDir = "$env:LOCALAPPDATA\LocalWarp"
 $BinaryName = "LocalWarp-Connector-windows-x64.exe"
 $TargetPath = "$InstallDir\$BinaryName"
 $DownloadUrl = "https://github.com/$Repo/releases/latest/download/$BinaryName"
+$StagedPath = Join-Path $InstallDir ([System.IO.Path]::GetRandomFileName())
 
 Write-Host "==================================================" -ForegroundColor Cyan
 Write-Host "    LocalWarp iPhone Location Connector (Windows)  " -ForegroundColor Cyan
@@ -28,19 +29,33 @@ if (!(Test-Path $InstallDir)) {
 # 2. Download executable
 Write-Host "[*] Downloading standalone LocalWarp Connector for Windows x64..." -ForegroundColor Yellow
 try {
-    Invoke-WebRequest -Uri $DownloadUrl -OutFile $TargetPath -UseBasicParsing
-    Write-Host "[+] Download complete: $TargetPath" -ForegroundColor Green
+    Invoke-WebRequest -Uri $DownloadUrl -OutFile $StagedPath -UseBasicParsing
+    Write-Host "[+] Download complete. Preparing installation..." -ForegroundColor Green
 } catch {
     Write-Host "[-] GitHub release download failed ($($_.Exception.Message))" -ForegroundColor Red
     Write-Host "[*] Looking for local build in current directory..." -ForegroundColor Yellow
     $LocalBuild = ".\dist\connectors\$BinaryName"
     if (Test-Path $LocalBuild) {
-        Copy-Item -Path $LocalBuild -Destination $TargetPath -Force
+        Copy-Item -Path $LocalBuild -Destination $StagedPath -Force
         Write-Host "[+] Copied from local build." -ForegroundColor Green
     } else {
+        Remove-Item -Path $StagedPath -Force -ErrorAction SilentlyContinue
         Write-Host "[-] Executable not found. Please build via scripts/build_connector.py first." -ForegroundColor Red
         exit 1
     }
+}
+
+# Stop only after the download succeeds. A running Windows executable cannot
+# be overwritten; staging also preserves the old installation on download failure.
+$ExistingProc = Get-Process -Name "LocalWarp-Connector*" -ErrorAction SilentlyContinue
+if ($ExistingProc) {
+    Stop-Process -InputObject $ExistingProc -Force
+    $ExistingProc | Wait-Process -ErrorAction SilentlyContinue
+}
+try {
+    Move-Item -Path $StagedPath -Destination $TargetPath -Force
+} finally {
+    Remove-Item -Path $StagedPath -Force -ErrorAction SilentlyContinue
 }
 
 # 3. Create Startup Shortcut
@@ -61,11 +76,6 @@ try {
 
 # 4. Start the Connector Process
 Write-Host "[*] Starting LocalWarp Connector daemon..." -ForegroundColor Yellow
-$ExistingProc = Get-Process -Name "LocalWarp-Connector*" -ErrorAction SilentlyContinue
-if ($ExistingProc) {
-    Stop-Process -InputObject $ExistingProc -Force
-}
-
 Start-Process -FilePath $TargetPath -WindowStyle Hidden
 
 Start-Sleep -Seconds 2
