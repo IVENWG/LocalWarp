@@ -15,6 +15,8 @@ Supports:
 import sys
 import os
 import re
+import base64
+import binascii
 import argparse
 import asyncio
 import ipaddress
@@ -58,13 +60,21 @@ except ImportError:
 # 身份文件由使用者自备（环境变量或 ~/.localwarp/identity/），连接器不携带凭据。
 try:
     from accessory_location import (
+        IDENTITY_STATE_READY,
         AccessoryLocationError,
         AccessoryLocationManager,
+        IdentityError,
+        identity_paths,
+        resolve_identity_state,
     )
 except ImportError:
     from src.backend.accessory_location import (
+        IDENTITY_STATE_READY,
         AccessoryLocationError,
         AccessoryLocationManager,
+        IdentityError,
+        identity_paths,
+        resolve_identity_state,
     )
 
 try:
@@ -78,7 +88,7 @@ try:
     # CI 打 tag 构建时由 build_connector.py 注入（build/version_stamp/_version.py）
     from _version import VERSION  # type: ignore[import-not-found]
 except Exception:
-    VERSION = "1.3.0"
+    VERSION = "1.4.0"
 
 # 云端权益授权：v1.1.0 起定位写入需要在线授权（短期内存缓存）
 from connector_auth import CloudAuthorizer, authorizer as cloud_authorizer
@@ -271,6 +281,15 @@ class AccessoryUpdateRequest(BaseModel):
     )
     udid: Optional[str] = Field(
         None, description="Device identifier (optional; session must already be running)")
+
+
+class AccessoryIdentityImportRequest(BaseModel):
+    certificate_b64: str = Field(
+        ..., min_length=1, max_length=64000,
+        description="DER PKCS#7 certificate container, base64-encoded")
+    key_b64: str = Field(
+        ..., min_length=1, max_length=64000,
+        description="Unencrypted DER PKCS#8 private key, base64-encoded")
 
 
 class BatchSimulateItem(BaseModel):
@@ -497,6 +516,24 @@ async def accessory_location_stop():
     except Exception as e:
         logger.error(f"Failed to stop accessory location session: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/location/accessory/identity")
+async def accessory_identity_import(req: AccessoryIdentityImportRequest):
+    """把用户自备的身份文件写入本地目录；连接器不下载、不缓存任何副本。"""
+    try:
+        certificate = base64.b64decode(req.certificate_b64, validate=True)
+        private_key = base64.b64decode(req.key_b64, validate=True)
+    except (binascii.Error, ValueError):
+        raise HTTPException(status_code=400, detail="Identity files must be base64-encoded")
+    try:
+        status = accessory_manager.install_identity(certificate, private_key)
+    except IdentityError as e:
+        raise HTTPException(status_code=400, detail=f"Identity rejected: {e}")
+    except OSError as e:
+        logger.error(f"Failed to store accessory identity: {e}")
+        raise HTTPException(status_code=500, detail="Could not write the identity files")
+    return {"success": True, "message": "Accessory identity installed", "data": status}
 
 
 @app.get("/api/location/accessory/status")
@@ -826,6 +863,7 @@ def print_banner(host: str, port: int):
     print(banner)
 
     print_windows_amds_warning()
+    print_accessory_identity_hint()
 
 
 def check_windows_amds() -> bool:
@@ -857,6 +895,25 @@ def print_windows_amds_warning():
         print("  【步骤 2】将 iPhone 插入电脑，解锁手机并在弹窗中点击【信任此电脑】")
         print("            装完后本程序将自动连通！")
         print("*" * 76 + "\n")
+
+
+def print_accessory_identity_hint():
+    """无线定位之外，有线增强步骤还需本机身份文件；CLI 入口没有界面，先给出落点。"""
+    try:
+        state = resolve_identity_state()
+    except Exception:
+        return
+    if state == IDENTITY_STATE_READY:
+        return
+    cert_path, _ = identity_paths()
+    print("-" * 76)
+    if state == "invalid":
+        print("[!] 配件身份文件已存在，但无法解析（需要 DER PKCS#7 证书 + 未加密 PKCS#8 私钥）")
+    else:
+        print("[!] 未找到配件身份文件：有线增强定位需要 certificate.p7b 与 identity.pk8")
+    print("    在网页工作台的增强定位面板中导入，或放到:")
+    print(f"    {cert_path.parent}")
+    print("-" * 76 + "\n")
 
 
 # ==============================================================================

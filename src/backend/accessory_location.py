@@ -19,7 +19,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import sys
 base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
@@ -41,6 +41,10 @@ IDENTITY_ENV_CERT = "LOCALWARP_IAP2_CERT_FILE"
 IDENTITY_ENV_KEY = "LOCALWARP_IAP2_KEY_FILE"
 DEFAULT_IDENTITY_DIR = Path.home() / ".localwarp" / "identity"
 
+IDENTITY_STATE_READY = "ready"
+IDENTITY_STATE_MISSING = "missing"
+IDENTITY_STATE_INVALID = "invalid"
+
 # 会话以固定时长分片循环：分片结束自动重建链路（顺带获得断线重连能力）
 SESSION_CHUNK_SECONDS = 300.0
 MAX_BACKOFF_SECONDS = 30.0
@@ -51,19 +55,57 @@ class AccessoryLocationError(RuntimeError):
     """会话管理错误（重复启动、未运行等确定性失败）。"""
 
 
-def resolve_identity(env: Optional[Dict[str, str]] = None,
-                     base: Optional[Path] = None) -> Optional[LocalMfiIdentity]:
-    """按 环境变量 → 默认目录 顺序解析用户自备身份；缺失或无效返回 None。"""
+def identity_paths(env: Optional[Dict[str, str]] = None,
+                   base: Optional[Path] = None) -> Tuple[Path, Path]:
+    """身份文件位置：环境变量优先，其次默认目录。"""
     environment = os.environ if env is None else env
     directory = DEFAULT_IDENTITY_DIR if base is None else Path(base)
     cert = environment.get(IDENTITY_ENV_CERT) or str(directory / "certificate.p7b")
     key = environment.get(IDENTITY_ENV_KEY) or str(directory / "identity.pk8")
-    if not (Path(cert).is_file() and Path(key).is_file()):
+    return Path(cert), Path(key)
+
+
+def resolve_identity(env: Optional[Dict[str, str]] = None,
+                     base: Optional[Path] = None) -> Optional[LocalMfiIdentity]:
+    """按 环境变量 → 默认目录 顺序解析用户自备身份；缺失或无效返回 None。"""
+    cert, key = identity_paths(env, base)
+    if not (cert.is_file() and key.is_file()):
         return None
     try:
         return LocalMfiIdentity.from_files(cert, key)
     except IdentityError:
         return None
+
+
+# 状态轮询每 2 秒一次，重复解析 PKCS#7 没有意义；键含 mtime/大小，替换文件后自动失效。
+_IDENTITY_STATE_CACHE: Dict[tuple, str] = {}
+
+
+def resolve_identity_state(env: Optional[Dict[str, str]] = None,
+                           base: Optional[Path] = None) -> str:
+    """区分「文件不在」与「文件在但无法解析」，供界面给出可操作提示。"""
+    cert, key = identity_paths(env, base)
+    try:
+        cert_stat = cert.stat()
+        key_stat = key.stat()
+    except OSError:
+        return IDENTITY_STATE_MISSING
+    cache_key = (
+        str(cert), str(key),
+        cert_stat.st_mtime_ns, cert_stat.st_size,
+        key_stat.st_mtime_ns, key_stat.st_size,
+    )
+    cached = _IDENTITY_STATE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        LocalMfiIdentity.from_files(cert, key)
+        state = IDENTITY_STATE_READY
+    except IdentityError:
+        state = IDENTITY_STATE_INVALID
+    _IDENTITY_STATE_CACHE.clear()
+    _IDENTITY_STATE_CACHE[cache_key] = state
+    return state
 
 
 def identity_configured(env: Optional[Dict[str, str]] = None,
@@ -110,10 +152,15 @@ class AccessoryLocationManager:
 
     def __init__(self,
                  runner: Optional[Callable[[_SessionState], Any]] = None,
-                 identity_resolver: Callable[[], Optional[LocalMfiIdentity]] = resolve_identity):
+                 identity_resolver: Callable[[], Optional[LocalMfiIdentity]] = resolve_identity,
+                 identity_state: Optional[Callable[[], str]] = None):
         # runner 注入点：测试用假实现替换真实 USB/链路栈
         self._runner = runner or self._default_runner
         self._identity_resolver = identity_resolver
+        # 只有默认解析器才配缓存状态探测；测试注入的解析器保持完全隔离
+        self._identity_state = identity_state or (
+            resolve_identity_state
+            if identity_resolver is resolve_identity else None)
         self._state: Optional[_SessionState] = None
         self._task: Optional[asyncio.Task] = None
         self._lock = asyncio.Lock()
@@ -158,12 +205,42 @@ class AccessoryLocationManager:
                 pass
         return self.status()
 
+    def _current_identity_state(self) -> str:
+        if self._identity_state is not None:
+            return self._identity_state()
+        return (IDENTITY_STATE_READY
+                if self._identity_resolver() else IDENTITY_STATE_MISSING)
+
+    def install_identity(self, certificate: bytes,
+                         private_key: bytes) -> Dict[str, Any]:
+        """校验后写入本地身份文件（0600，原子替换）；不校验 Apple 信任链。"""
+        LocalMfiIdentity(certificate, private_key)
+        cert_path, key_path = identity_paths()
+        for path, data in ((cert_path, certificate), (key_path, private_key)):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(path.parent, 0o700)
+            except OSError:
+                pass
+            tmp = path.with_name(path.name + ".tmp")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+            os.replace(tmp, path)
+        _IDENTITY_STATE_CACHE.clear()
+        return self.status()
+
     def status(self) -> Dict[str, Any]:
         state = self._state
         running = self._task is not None and not self._task.done()
+        identity_state = self._current_identity_state()
+        cert_path, _ = identity_paths()
         base: Dict[str, Any] = {
             "running": running,
-            "identity_configured": bool(self._identity_resolver()),
+            "identity_configured": identity_state == IDENTITY_STATE_READY,
+            # missing = 文件不在；invalid = 文件在但解析失败（界面需分别提示）
+            "identity_state": identity_state,
+            "identity_directory": str(cert_path.parent),
             "phone_location_verified": False,
             "constraint": ("iOS only adopts accessory fixes within ~15 km of the "
                            "phone's own position estimate (positionDiffBound). "

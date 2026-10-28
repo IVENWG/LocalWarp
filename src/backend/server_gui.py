@@ -23,6 +23,8 @@ import webbrowser
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 28888
 WORKBENCH_URL = "https://localwarp.com/app"
+# 深链：工作台直接打开增强定位面板，主面板会显示配件身份文件导入入口
+ENHANCED_WORKBENCH_URL = f"{WORKBENCH_URL}?mode=enhanced"
 
 
 def check_and_run_worker() -> None:
@@ -150,6 +152,10 @@ def run_tray(server, server_thread, started: bool, port: int, log_path: str):
     def open_workbench(icon=None, item=None):
         webbrowser.open(WORKBENCH_URL)
 
+    def open_identity_import(icon=None, item=None):
+        log.info("Opening enhanced workbench for accessory identity import")
+        webbrowser.open(ENHANCED_WORKBENCH_URL)
+
     def quit_app(icon=None, item=None):
         log.info("Quit requested from tray")
         server.should_exit = True
@@ -180,8 +186,16 @@ def run_tray(server, server_thread, started: bool, port: int, log_path: str):
                 log.warning("AMDS (Apple Mobile Device Service) not detected — install iTunes/Apple Devices app to connect iPhones")
         except Exception:
             pass
+        try:
+            from server import IDENTITY_STATE_READY, resolve_identity_state
+            if resolve_identity_state() != IDENTITY_STATE_READY:
+                tooltip += " · 待导入配件身份文件"
+                log.warning("Accessory identity files missing; point users to tray menu「导入配件身份文件…」")
+        except Exception:
+            pass
 
     menu = Menu(
+        MenuItem("导入配件身份文件…", open_identity_import, enabled=started),
         MenuItem("打开工作台", open_workbench, default=True, enabled=started),
         Menu.SEPARATOR,
         MenuItem("退出", quit_app),
