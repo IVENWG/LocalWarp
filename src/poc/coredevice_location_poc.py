@@ -396,6 +396,7 @@ class CoreDeviceLocationManager:
                         "model": friendly_model,
                         "raw_model": raw_model,
                         "ecid": r.get("ecid"),
+                        "ios_version": r.get("osVersion") or r.get("ProductVersion"),
                         "auth_state": r.get("authState", {}).get("rawCase", "authenticated"),
                         "connection_type": "Wi-Fi" if is_wireless else "USB",
                         "is_coredevice": True,
@@ -447,6 +448,7 @@ class CoreDeviceLocationManager:
                     # 每次轮询都会新挂起一个协程，必须限时返回
                     lk = await create_using_usbmux(serial=serial, pair_timeout=2.0)
                     try:
+                        dev_entry["ios_version"] = lk.all_values.get("ProductVersion")
                         if hasattr(lk, "get_developer_mode_status"):
                             dev_on = await lk.get_developer_mode_status()
                             dev_entry["developer_mode"] = dev_on
@@ -468,17 +470,26 @@ class CoreDeviceLocationManager:
                 return dev_entry
 
             candidates = []
+            candidate_serials = set()
             for d in mux_devs:
                 serial = getattr(d, "serial", None) or getattr(d, "udid", None)
-                if not serial or serial in seen_udids:
+                if not serial or serial in candidate_serials:
+                    continue
+                candidate_serials.add(serial)
+                existing = next((item for item in devices if item["udid"] == serial), None)
+                if existing and existing.get("ios_version"):
                     continue
                 seen_udids.add(serial)
                 candidates.append((serial, getattr(d, "ecid", None)))
             # 并行探测：多台未信任设备时避免 2s/台的串行配对等待把接口拖过前端超时预算
             if candidates:
-                devices.extend(
-                    await asyncio.gather(*(probe_mux_device(serial, ecid) for serial, ecid in candidates))
-                )
+                probed = await asyncio.gather(*(probe_mux_device(serial, ecid) for serial, ecid in candidates))
+                for entry in probed:
+                    existing = next((item for item in devices if item["udid"] == entry["udid"]), None)
+                    if existing is not None:
+                        existing["ios_version"] = entry.get("ios_version")
+                    else:
+                        devices.append(entry)
         except Exception as e:
             from pymobiledevice3.exceptions import ConnectionFailedToUsbmuxdError
             if isinstance(e, ConnectionFailedToUsbmuxdError):
@@ -633,9 +644,13 @@ class CoreDeviceLocationManager:
                                 from pymobiledevice3.services.mobile_image_mounter import auto_mount
                                 await asyncio.wait_for(auto_mount(client.rsd), timeout=MOUNT_TIMEOUT_S)
                                 logger.info("DDI successfully mounted! Re-establishing fresh RSD session...")
-                            except Exception:
-                                logger.warning(f"auto_mount failed on {key}; giving up this request")
-                                raise e
+                            except Exception as mount_error:
+                                # 保留挂载失败原因（如 DeviceLocked）：通用 "No such service" 无法
+                                # 指导用户解锁手机，首挂载失败最常见的原因就是锁屏。
+                                logger.warning(f"auto_mount failed on {key} ({mount_error}); giving up this request")
+                                raise RuntimeError(
+                                    f"developer disk image could not be mounted: {mount_error}"
+                                ) from e
                             await self._disconnect_device_unlocked(key)
                             client = await self._create_client_checked(device_id, key)
                             result = await asyncio.wait_for(invoke(client), timeout=INVOKE_TIMEOUT_S)

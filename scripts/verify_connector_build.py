@@ -26,7 +26,9 @@ import os
 import platform
 import sys
 
-CORE_MODULES = ("coredevice_location_poc", "connector_auth", "multi_device")
+CORE_MODULES = ("coredevice_location_poc", "connector_auth", "multi_device",
+                "accessory_location", "iap2_accessory_location", "wloc_proxy",
+                "dns_location")
 RUNTIME_MODULES = ("pymobiledevice3", "uvicorn", "fastapi", "construct")
 
 

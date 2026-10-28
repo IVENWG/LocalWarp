@@ -23,7 +23,7 @@ import platform
 import shlex
 import subprocess
 import xml.sax.saxutils
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Literal
 from urllib.parse import urlsplit
 from pydantic import BaseModel, Field
 
@@ -38,7 +38,7 @@ if os.path.exists(_vendored_pmd3) and _vendored_pmd3 not in sys.path:
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 import uvicorn
 
 try:
@@ -54,11 +54,31 @@ try:
 except ImportError:
     from src.backend.multi_device import MultiDeviceManager
 
+# iAP2 配件定位（实验性增强通道）：会话制语义 start/update/stop/status，
+# 身份文件由使用者自备（环境变量或 ~/.localwarp/identity/），连接器不携带凭据。
+try:
+    from accessory_location import (
+        AccessoryLocationError,
+        AccessoryLocationManager,
+    )
+except ImportError:
+    from src.backend.accessory_location import (
+        AccessoryLocationError,
+        AccessoryLocationManager,
+    )
+
+try:
+    from wloc_proxy import WlocProxy, build_pac, build_shadowrocket_config
+    from dns_location import DnsLocationError, DnsLocationManager
+except ImportError:
+    from src.backend.wloc_proxy import WlocProxy, build_pac, build_shadowrocket_config
+    from src.backend.dns_location import DnsLocationError, DnsLocationManager
+
 try:
     # CI 打 tag 构建时由 build_connector.py 注入（build/version_stamp/_version.py）
     from _version import VERSION  # type: ignore[import-not-found]
 except Exception:
-    VERSION = "1.1.0"
+    VERSION = "1.3.0"
 
 # 云端权益授权：v1.1.0 起定位写入需要在线授权（短期内存缓存）
 from connector_auth import CloudAuthorizer, authorizer as cloud_authorizer
@@ -178,14 +198,33 @@ async def guard_local_access(request: Request, call_next):
 is_darwin = platform.system() == "Darwin"
 manager = MultiDeviceManager(CoreDeviceLocationManager(use_userspace=not is_darwin))
 
+# iAP2 配件定位会话管理器（实验性增强通道，独立于 CoreDevice 路由）
+accessory_manager = AccessoryLocationManager()
+wloc_manager = WlocProxy()
+# DNS 劫持定位通道：真机闭环的软件模拟定位（详见 docs/research 第四轮）。
+# 53/443 在 Unix 上为特权端口；开发/测试可用环境变量改高位端口。
+dns_manager = DnsLocationManager(
+    dns_port=int(os.environ.get("LOCALWARP_DNS_PORT", "53")),
+    tls_port=int(os.environ.get("LOCALWARP_TLS_PORT", "443")))
+enhanced_location_lock = asyncio.Lock()
+
 
 @app.on_event("shutdown")
 async def shutdown_multi_device_event():
     """优雅关闭：关停所有设备 worker 子进程并释放全部设备会话。"""
     try:
+        await dns_manager.shutdown()
+    except Exception as e:
+        logger.warning(f"dns manager shutdown notice: {e}")
+    await wloc_manager.shutdown()
+    try:
         await manager.shutdown()
     except Exception as e:
         logger.warning(f"manager shutdown notice: {e}")
+    try:
+        await accessory_manager.stop()
+    except Exception as e:
+        logger.warning(f"accessory manager shutdown notice: {e}")
 
 
 class SimulateLocationRequest(BaseModel):
@@ -200,8 +239,38 @@ class SimulateLocationRequest(BaseModel):
     )
 
 
+class DnsLocationRequest(SimulateLocationRequest):
+    mode: Literal['rewrite', 'suppress'] = 'rewrite'
+
+
 class ClearLocationRequest(BaseModel):
     udid: Optional[str] = Field(None, description="Device UDID (optional if single device)")
+
+
+class AccessoryStartRequest(BaseModel):
+    latitude: float = Field(
+        ..., ge=-90.0, le=90.0, allow_inf_nan=False,
+        description="Latitude in decimal degrees",
+    )
+    longitude: float = Field(
+        ..., ge=-180.0, le=180.0, allow_inf_nan=False,
+        description="Longitude in decimal degrees",
+    )
+    udid: Optional[str] = Field(None, description="Device identifier (USB selection hint)")
+    interval: float = Field(1.0, ge=1.0, le=60.0, description="NMEA send interval in seconds")
+
+
+class AccessoryUpdateRequest(BaseModel):
+    latitude: float = Field(
+        ..., ge=-90.0, le=90.0, allow_inf_nan=False,
+        description="Latitude in decimal degrees",
+    )
+    longitude: float = Field(
+        ..., ge=-180.0, le=180.0, allow_inf_nan=False,
+        description="Longitude in decimal degrees",
+    )
+    udid: Optional[str] = Field(
+        None, description="Device identifier (optional; session must already be running)")
 
 
 class BatchSimulateItem(BaseModel):
@@ -237,7 +306,8 @@ class ConnectorAuthConfigureRequest(BaseModel):
 @app.get("/health")
 @app.get("/api/health")
 async def health_check():
-    caps = ["cloud-auth", "multi-device"]
+    caps = ["cloud-auth", "multi-device", "accessory-location", "wloc-proxy",
+            "dns-location"]
     return {
         "status": "healthy",
         "service": "LocalWarp Connector",
@@ -361,6 +431,180 @@ async def clear_location(req: ClearLocationRequest):
     except Exception as e:
         logger.error(f"Failed to clear location: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# iAP2 配件定位（实验性增强通道）：会话制语义，与 CoreDevice 主线相互独立。
+# 身份文件由使用者自备（环境变量 LOCALWARP_IAP2_CERT_FILE/KEY_FILE 或
+# ~/.localwarp/identity/），连接器与仓库均不携带凭据。
+# ---------------------------------------------------------------------------
+
+@app.post("/api/location/accessory/start")
+async def accessory_location_start(req: AccessoryStartRequest):
+    ok, reason = await cloud_authorizer.ensure_authorized_async(req.udid or "")
+    if not ok:
+        logger.warning(f"Accessory start denied by cloud authorization: {reason}")
+        raise HTTPException(status_code=403, detail=reason)
+    try:
+        logger.info(
+            f"Accessory location start: lat={req.latitude}, lon={req.longitude}, "
+            f"udid={req.udid}, interval={req.interval}")
+        async with enhanced_location_lock:
+            if (wloc_manager.status()["running"]
+                    or (dns_manager.running and dns_manager.mode != "suppress")):
+                raise AccessoryLocationError("Stop wloc/DNS rewrite before starting accessory location")
+            status = await accessory_manager.start(
+                req.latitude, req.longitude,
+                serial=req.udid, interval=req.interval)
+        return {"success": True, "message": "Accessory location session started", "data": status}
+    except AccessoryLocationError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Failed to start accessory location session: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/location/accessory/update")
+async def accessory_location_update(req: AccessoryUpdateRequest):
+    # 会话在 start 时已通过权益门禁。update 携带 udid 时再复核一次权益；
+    # 未携带时不再向云端要授权（空 udid 会被云端以 missing target device
+    # 拒绝），会话存在性由 manager.update 校验（无会话返回 409）
+    if req.udid:
+        ok, reason = await cloud_authorizer.ensure_authorized_async(req.udid)
+        if not ok:
+            logger.warning(f"Accessory update denied by cloud authorization: {reason}")
+            raise HTTPException(status_code=403, detail=reason)
+    try:
+        status = await accessory_manager.update(req.latitude, req.longitude)
+        return {"success": True, "message": "Accessory location target updated", "data": status}
+    except AccessoryLocationError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Failed to update accessory location target: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/location/accessory/stop")
+async def accessory_location_stop():
+    try:
+        async with enhanced_location_lock:
+            status = await accessory_manager.stop()
+        return {"success": True, "message": "Accessory location session stopped", "data": status}
+    except Exception as e:
+        logger.error(f"Failed to stop accessory location session: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/location/accessory/status")
+async def accessory_location_status():
+    status = accessory_manager.status()
+    status['dns_location'] = dns_manager.status()
+    status['combination_running'] = bool(status['running'] and dns_manager.running and dns_manager.mode == 'suppress')
+    return status
+
+
+@app.post("/api/location/wloc/start")
+async def wloc_location_start(req: SimulateLocationRequest):
+    ok, reason = await cloud_authorizer.ensure_authorized_async(req.udid or "")
+    if not ok:
+        raise HTTPException(status_code=403, detail=reason)
+    async with enhanced_location_lock:
+        if (accessory_manager.status()["running"] or wloc_manager.status()["running"]
+                or dns_manager.running):
+            raise HTTPException(status_code=409, detail="Stop the active enhanced location channel first")
+        try:
+            return await wloc_manager.start(req.latitude, req.longitude)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error))
+        except OSError as error:
+            raise HTTPException(status_code=503, detail=str(error))
+
+
+@app.post("/api/location/wloc/stop")
+async def wloc_location_stop():
+    async with enhanced_location_lock:
+        return await wloc_manager.stop()
+
+
+@app.get("/api/location/wloc/status")
+async def wloc_location_status():
+    # First use prepares the dedicated CA and public-certificate-only LAN listener.
+    return await wloc_manager.prepare()
+
+
+# ---------------------------------------------------------------------------
+# DNS 劫持定位通道（软件模拟定位主路线，真机闭环见 docs/research 第四轮）
+# ---------------------------------------------------------------------------
+
+@app.post("/api/location/dns/start")
+async def dns_location_start(req: DnsLocationRequest):
+    ok, reason = await cloud_authorizer.ensure_authorized_async(req.udid or "")
+    if not ok:
+        raise HTTPException(status_code=403, detail=reason)
+    async with enhanced_location_lock:
+        if ((req.mode == 'rewrite' and accessory_manager.status()["running"])
+                or wloc_manager.status()["running"]):
+            raise HTTPException(status_code=409, detail="Stop the active enhanced location channel first")
+        try:
+            if req.mode == 'rewrite':
+                # Prepare the public certificate download listener for the phone.
+                # Suppression must never require or generate a CA.
+                await wloc_manager.prepare()
+            return await dns_manager.start(req.latitude, req.longitude, mode=req.mode)
+        except DnsLocationError as error:
+            raise HTTPException(status_code=409, detail=str(error))
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error))
+
+
+@app.post("/api/location/dns/stop")
+async def dns_location_stop():
+    async with enhanced_location_lock:
+        return await dns_manager.stop()
+
+
+@app.get("/api/location/dns/status")
+async def dns_location_status():
+    return dns_manager.status()
+
+
+@app.get("/api/location/wloc/proxy.pac")
+async def wloc_pac_download(request: Request):
+    await wloc_manager.prepare()
+    host = request.url.hostname or "127.0.0.1"
+    if host == "localhost":
+        host = "127.0.0.1"
+    try:
+        content = build_pac(host, wloc_manager.port)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    return Response(content, media_type="application/x-ns-proxy-autoconfig",
+                    headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/location/wloc/shadowrocket.conf")
+async def wloc_shadowrocket_config(request: Request):
+    await wloc_manager.prepare()
+    host = request.url.hostname or "127.0.0.1"
+    if host == "localhost":
+        host = "127.0.0.1"
+    try:
+        content = build_shadowrocket_config(host, wloc_manager.port)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    return Response(content, media_type="text/plain",
+                    headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/location/wloc/ca.pem")
+async def wloc_ca_download():
+    await wloc_manager.prepare()
+    return Response(wloc_manager.store.pem(), media_type="application/x-x509-ca-cert",
+                    headers={"Content-Disposition": 'attachment; filename="LocalWarp-WLoc-CA.pem"'})
 
 
 @app.post("/api/device/disconnect")

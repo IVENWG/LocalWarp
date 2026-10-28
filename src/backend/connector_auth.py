@@ -26,6 +26,7 @@ LocalWarp Connector — Cloud Entitlement Authorization Guard
 """
 
 import asyncio
+import os
 import re
 import threading
 import time
@@ -383,4 +384,6 @@ class CloudAuthorizer:
 
 
 # 模块级单例：server.py 直接使用
-authorizer = CloudAuthorizer()
+authorizer = CloudAuthorizer(
+    allow_dev=os.getenv("LOCALWARP_ALLOW_DEV") == "1"
+)

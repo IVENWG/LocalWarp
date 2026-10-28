@@ -120,8 +120,14 @@ def build():
     ]
     cmd.extend([
         f"--add-data={POC_DIR}{sep}src/poc",
+        f"--add-data={os.path.join(ROOT_DIR, 'licenses', 'wloc-MIT.txt')}{sep}licenses",
         # 多设备：worker 入口模块 + 打包产物 worker 重定向运行时钩子
         "--hidden-import=multi_device",
+        # iAP2 配件定位（实验性增强通道）
+        "--hidden-import=accessory_location",
+        "--hidden-import=wloc_proxy",
+        "--hidden-import=dns_location",
+        "--hidden-import=iap2_accessory_location",
         f"--runtime-hook={os.path.join(ROOT_DIR, 'scripts', 'pyinstaller_worker_hook.py')}",
         "--collect-all=pymobiledevice3",
         "--collect-all=construct",
