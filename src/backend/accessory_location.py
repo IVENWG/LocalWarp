@@ -2,7 +2,7 @@
 """iAP2 配件定位会话管理器（实验性增强通道）。
 
 与 CoreDevice/DVT 主线（写入即返回、拔线保持）不同，本通道是会话制：
-发送器保持运行期间系统定位被采信，停止即恢复真实定位。因此对外语义是
+发送器保持运行期间持续提供配件定位，系统是否采信须另行验证。因此对外语义是
 start/update/stop/status，而不是 simulate/clear。
 
 身份边界：连接器不携带任何 MFi 凭据。身份文件由使用者提供：
@@ -45,8 +45,8 @@ IDENTITY_STATE_READY = "ready"
 IDENTITY_STATE_MISSING = "missing"
 IDENTITY_STATE_INVALID = "invalid"
 
-# 会话以固定时长分片循环：分片结束自动重建链路（顺带获得断线重连能力）
-SESSION_CHUNK_SECONDS = 300.0
+# 会话采用无限长连接持久运行；绝不主动分片断开，避免产生外设断流空窗期
+SESSION_CHUNK_SECONDS = float("inf")
 MAX_BACKOFF_SECONDS = 30.0
 RECENT_EVENT_LIMIT = 30
 
@@ -153,17 +153,39 @@ class AccessoryLocationManager:
     def __init__(self,
                  runner: Optional[Callable[[_SessionState], Any]] = None,
                  identity_resolver: Callable[[], Optional[LocalMfiIdentity]] = resolve_identity,
-                 identity_state: Optional[Callable[[], str]] = None):
+                 identity_state: Optional[Callable[[], str]] = None,
+                 auth_guard: Optional[Callable[[str], bool]] = None):
         # runner 注入点：测试用假实现替换真实 USB/链路栈
         self._runner = runner or self._default_runner
         self._identity_resolver = identity_resolver
+        self._auth_guard = auth_guard
         # 只有默认解析器才配缓存状态探测；测试注入的解析器保持完全隔离
         self._identity_state = identity_state or (
             resolve_identity_state
             if identity_resolver is resolve_identity else None)
         self._state: Optional[_SessionState] = None
         self._task: Optional[asyncio.Task] = None
+        self._guard_task: Optional[asyncio.Task] = None
         self._lock = asyncio.Lock()
+
+    def _check_auth(self, serial: Optional[str]) -> bool:
+        if self._auth_guard is None:
+            return True
+        return self._auth_guard(serial or "")
+
+    async def _expiry_guard_loop(self, state: _SessionState) -> None:
+        try:
+            while True:
+                await asyncio.sleep(0.5)
+                if not self._check_auth(state.serial):
+                    state.last_error = "authorization expired: accessory location stopped"
+                    async with self._lock:
+                        task = self._task
+                    if task is not None and not task.done():
+                        task.cancel()
+                    break
+        except asyncio.CancelledError:
+            pass
 
     # ---- 对外接口 -------------------------------------------------------
 
@@ -183,12 +205,16 @@ class AccessoryLocationManager:
                                   started_at=time.time())
             self._state = state
             self._task = asyncio.create_task(self._run_loop(state))
+            self._guard_task = asyncio.create_task(self._expiry_guard_loop(state))
             return self.status()
 
     async def update(self, latitude: float, longitude: float) -> Dict[str, Any]:
         state = self._state
         if state is None or self._task is None or self._task.done():
             raise AccessoryLocationError("no running accessory location session")
+        if not self._check_auth(state.serial):
+            await self.stop()
+            raise AccessoryLocationError("authorization expired: refresh workbench to renew")
         validate_coordinates(latitude, longitude)
         state.target.latitude = float(latitude)
         state.target.longitude = float(longitude)
@@ -197,6 +223,13 @@ class AccessoryLocationManager:
     async def stop(self) -> Dict[str, Any]:
         async with self._lock:
             task, self._task = self._task, None
+            guard, self._guard_task = self._guard_task, None
+        if guard is not None and not guard.done():
+            guard.cancel()
+            try:
+                await guard
+            except (asyncio.CancelledError, Exception):
+                pass
         if task is not None and not task.done():
             task.cancel()
             try:
@@ -233,21 +266,22 @@ class AccessoryLocationManager:
     def status(self) -> Dict[str, Any]:
         state = self._state
         running = self._task is not None and not self._task.done()
+        if running and state is not None and not self._check_auth(state.serial):
+            running = False
         identity_state = self._current_identity_state()
         cert_path, _ = identity_paths()
         base: Dict[str, Any] = {
             "running": running,
+            "profile": "location",
             "identity_configured": identity_state == IDENTITY_STATE_READY,
             # missing = 文件不在；invalid = 文件在但解析失败（界面需分别提示）
             "identity_state": identity_state,
             "identity_directory": str(cert_path.parent),
             "phone_location_verified": False,
-            "constraint": ("iOS only adopts accessory fixes within ~15 km of the "
-                           "phone's own position estimate (positionDiffBound). "
-                           "Verified far-teleport recipe (iOS 15): keep the "
-                           "phone offline (airplane mode), reset Location & "
-                           "Privacy once, keep the session running — adopted "
-                           "immediately; re-anchors ~1 min after radios return"),
+            "constraint": ("iOS applies NMEA screening (dynamic positionDiffBound) "
+                           "and IntegrityMonitor checks. DNS suppression does not "
+                           "guarantee adoption of distant coordinates. Link ACK "
+                           "and accessory Fix=1 alone do not verify the map location."),
             "note": ("experimental accessory channel: link ACK does not prove "
                      "iOS adopted the coordinates; session-based (stops restore "
                      "real location)"),
@@ -305,7 +339,7 @@ class AccessoryLocationManager:
         link = Iap2Link(stream, state.record)
         try:
             await link.handshake()
-            session = AccessoryLocationSession(link, identity, state.record)
+            session = AccessoryLocationSession(link, identity, state.record, carplay=False)
             summary = await session.run(
                 send=True, duration=SESSION_CHUNK_SECONDS,
                 interval=state.interval, target=state.target)

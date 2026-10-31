@@ -10,7 +10,7 @@ NMEA GGA/RMC（FFFB），使 iPhone 把本机当作外接定位配件。
 - CoreDevice/DVT 是「开发者软件模拟」来源（isSimulatedBySoftware）；本通道
   是「外接配件」来源（isProducedByAccessory），二者在 Core Location 中是
   不同的定位来源标记。
-- 本通道为会话制：发送期间定位被系统采信，停止发送后手机恢复自身定位，
+- 本通道为会话制：发送期间提供配件定位，是否采信仍由 iOS 判断，
   不具备 CoreDevice 主线的「拔线保持」语义。
 
 重要边界（与仓库既有证据纪律一致）：
@@ -74,8 +74,8 @@ MSG_LOCATION_INFORMATION = 0xFFFB
 MSG_LOCATION_STOP = 0xFFFC
 
 # 有线 CarPlay 会话（LIVI 流程；参数编码参照 xcertplay 真车实现）。
-# 关键假设：手机只把"有活跃 CarPlay 会话的配件"当连续可信定位源——
-# 无会话的裸定位配件仅在定位服务重初始化时被采样一次（真机实测）。
+# 保留 CarPlay 画像作对照；纯 Location 画像已在本机通过地图观察验证，
+# CarPlay 会话并非定位采纳的已证必要条件。
 MSG_CARPLAY_AVAILABILITY = 0x4300   # 手机 → 配件：CarPlay 可用性询问
 MSG_CARPLAY_START_SESSION = 0x4301  # 配件 → 手机：开始会话（有线，无需真实 AirPlay 流）
 MSG_START_NOW_PLAYING_UPDATES = 0x5000       # 认证后配件主动订阅的手机侧更新
@@ -274,8 +274,9 @@ def location_sentences(latitude: float, longitude: float,
     return {
         1: nmea_sentence(
             f"GPGGA,{clock},{lat},{north},{lon},{east},1,08,0.9,10.0,M,0.0,M,,"),
+        # 沿用本机曾采纳的运动字段；它们不能保证绕过系统完整性筛查。
         2: nmea_sentence(
-            f"GPRMC,{clock},A,{lat},{north},{lon},{east},0.0,0.0,{date},,,A"),
+            f"GPRMC,{clock},A,{lat},{north},{lon},{east},5.0,90.0,{date},,,A"),
     }
 
 
@@ -295,9 +296,8 @@ _SIMULATED_CONSTELLATION = (
 def supplementary_sentences() -> list[str]:
     """GSA/GSV 星座细节，随 GGA 同包发送。
 
-    只发 GGA+RMC 时，locationd 按中等完整性处理该 fix，受 15 km
-    positionDiffBound 约束（2026-10-25 实测）；携带与 GGA 卫星数/HDOP
-    自洽的星座视图是商业 CarPlay 盒子的通行做法，用于抬高完整性评级。
+    字段与 GGA 卫星数/HDOP 保持一致。此前远场对照已证实这些句子
+    不能单独解除动态 positionDiffBound，也不保证提升系统信任等级。
     """
     sats = len(_SIMULATED_CONSTELLATION)
     active = ",".join(f"{prn:02d}" for prn, *_ in _SIMULATED_CONSTELLATION)
@@ -320,26 +320,30 @@ def supplementary_sentences() -> list[str]:
 
 
 def identity_message(transport: str = "usb",
-                     bluetooth_address: Optional[bytes] = None) -> Message:
+                     bluetooth_address: Optional[bytes] = None,
+                     carplay: bool = True) -> Message:
     fields = [
         text_parameter(i, v) for i, v in enumerate(
             ("LocalWarp Lab", "LW-IAP2-1", "LocalWarp Research",
              "LW-LOCAL-001", "0.1", "1"))
     ]
+    sent_messages = (CARPLAY_SENT_MESSAGES if carplay
+                     else (MSG_LOCATION_INFORMATION,))
+    received_messages = (CARPLAY_RECEIVED_MESSAGES if carplay
+                         else (MSG_LOCATION_START, MSG_LOCATION_STOP))
     fields += [
-        # 能力表：LIVI 有线配件画像（含 0x4301 会话能力），定位消息走第 22 组
-        parameter(6, b"".join(struct.pack(">H", m) for m in CARPLAY_SENT_MESSAGES)),
-        parameter(
-            7, b"".join(struct.pack(">H", m) for m in CARPLAY_RECEIVED_MESSAGES)),
+        parameter(6, b"".join(struct.pack(">H", m) for m in sent_messages)),
+        parameter(7, b"".join(struct.pack(">H", m) for m in received_messages)),
         parameter(8, b"\x02"),          # 有线配件
         parameter(9, struct.pack(">H", 20)),
         text_parameter(12, "en"),
         text_parameter(13, "en"),
     ]
+    # USB/Bluetooth 传输组件是任何配件识别的前置条件，纯 Location 画像同样需要
     component = (parameter(0, b"\0\0")
                  + text_parameter(1, "Location Transport")
                  + parameter(2)
-                 + parameter(3, b"\0"))  # CarPlay USB 接口号 0（LIVI 默认）
+                 + parameter(3, b"\0"))  # 接口号 0
     if transport == "usb":
         fields.append(parameter(16, component))
     elif transport == "bluetooth":
@@ -348,18 +352,19 @@ def identity_message(transport: str = "usb",
         fields.append(parameter(17, component + parameter(3, bluetooth_address)))
     else:
         raise ValueError(f"Unknown transport: {transport}")
-    # HID 媒体播放组件（LIVI 画像）
-    fields.append(parameter(
-        18,
-        parameter(0, b"\0\0")
-        + text_parameter(1, "Media Playback Remote")
-        + parameter(2, b"\x01")))
-    # 外部配件协议声明（与消息表中的 0xea00/0xea01 配对，缺失会被拒识）
-    fields.append(parameter(
-        10,
-        parameter(0, b"\x01")
-        + text_parameter(1, "dev.localwarp.connector")
-        + parameter(2, b"\0")))
+    if carplay:
+        # HID 媒体播放组件（LIVI 画像）
+        fields.append(parameter(
+            18,
+            parameter(0, b"\0\0")
+            + text_parameter(1, "Media Playback Remote")
+            + parameter(2, b"\x01")))
+        # 外部配件协议声明（与消息表中的 0xea00/0xea01 配对，缺失会被拒识）
+        fields.append(parameter(
+            10,
+            parameter(0, b"\x01")
+            + text_parameter(1, "dev.localwarp.connector")
+            + parameter(2, b"\0")))
     # 定位组：组件 0 + 名称 GPS + 能力槽 17/18（GGA/RMC）；不声明无线 CarPlay
     location = parameter(0, b"\0\0") + text_parameter(1, "GPS")
     fields.append(parameter(22, location + parameter(17) + parameter(18)))
@@ -593,6 +598,7 @@ class Iap2Link:
                  emit: Callable[..., None] = lambda **_: None) -> None:
         self.stream = stream
         self.emit = emit
+        self.trace_enabled = os.environ.get("LOCALWARP_IAP2_TRACE") == "1"
         self.sequence = secrets.randbelow(256)
         self.peer_sequence = 0
         self.session = 1
@@ -609,7 +615,26 @@ class Iap2Link:
                 or not 9 <= size <= MAX_PACKET):
             raise ProtocolError("Malformed or oversized incoming packet")
         body = await self.stream.recvall(size - 9) if size > 9 else b""
-        return Packet.decode(header + body)
+        packet = Packet.decode(header + body)
+        self._trace_packet("rx", packet)
+        return packet
+
+    def _trace_packet(self, direction: str, packet: Packet) -> None:
+        if self.trace_enabled:
+            self.emit(event="iap2_packet", direction=direction,
+                      timestamp=datetime.now(UTC).isoformat(),
+                      flags=packet.flags, sequence=packet.sequence,
+                      acknowledgement=packet.acknowledgement,
+                      session=packet.session, payload_bytes=len(packet.payload))
+
+    def _trace_message(self, direction: str, message: Message) -> None:
+        if self.trace_enabled:
+            # Metadata only: authentication challenges, certificates and signatures
+            # must never enter diagnostic output.
+            self.emit(event="iap2_control", direction=direction,
+                      timestamp=datetime.now(UTC).isoformat(),
+                      identifier=f"0x{message.identifier:04X}",
+                      body_bytes=len(message.body))
 
     async def _read(self, timeout: float) -> Packet:
         # 读任务跨调用超时存活，半包状态不丢失
@@ -625,6 +650,7 @@ class Iap2Link:
 
     async def _write(self, packet: Packet) -> None:
         await self.stream.sendall(packet.encode())
+        self._trace_packet("tx", packet)
 
     async def acknowledge(self) -> None:
         await self._write(Packet(FLAG_ACK, self.sequence, self.peer_sequence))
@@ -672,12 +698,16 @@ class Iap2Link:
                 self.peer_sequence = packet.sequence
                 if packet.session != self.session:
                     raise ProtocolError("Data on an unnegotiated session")
-                self.messages.extend(self.assembler.feed(packet.payload))
+                messages = self.assembler.feed(packet.payload)
+                for message in messages:
+                    self._trace_message("rx", message)
+                self.messages.extend(messages)
             # 重复或乱序：只确认最后连续序号，绝不重复投递
             await self.acknowledge()
 
     async def send(self, message: Message) -> None:
         raw = message.encode()
+        self._trace_message("tx", message)
         chunk = self.maximum_packet - 10
         for offset in range(0, len(raw), chunk):
             self.sequence = (self.sequence + 1) & 0xFF
@@ -746,10 +776,12 @@ class AccessoryLocationSession:
 
     def __init__(self, link: Iap2Link,
                  identity: Optional[LocalMfiIdentity],
-                 emit: Callable[..., None] = lambda **_: None) -> None:
+                 emit: Callable[..., None] = lambda **_: None,
+                 carplay: bool = True) -> None:
         self.link = link
         self.identity = identity
         self.emit = emit
+        self.carplay = carplay
 
     async def run(self, latitude: Optional[float] = None,
                   longitude: Optional[float] = None, *,
@@ -785,7 +817,8 @@ class AccessoryLocationSession:
                 if message is not None:
                     fields = parse_parameters(message.body)
                     if message.identifier == MSG_IDENTIFY_START:
-                        await self.link.send(identity_message("usb"))
+                        await self.link.send(
+                            identity_message("usb", carplay=self.carplay))
                     elif message.identifier == MSG_IDENTIFY_ACCEPTED:
                         summary.identified = True
                         self.emit(event="identification_accepted")
@@ -814,7 +847,7 @@ class AccessoryLocationSession:
                         self.emit(event="authentication_succeeded")
                         # LIVI 有线握手：认证后订阅手机侧更新，
                         # 让手机把本配件视为完整车机而非裸定位设备
-                        if not bringup_sent:
+                        if self.carplay and not bringup_sent:
                             bringup_sent = True
                             for subscription in bringup_subscriptions():
                                 await self.link.send(subscription)
@@ -824,7 +857,8 @@ class AccessoryLocationSession:
                     elif message.identifier == MSG_CARPLAY_AVAILABILITY:
                         # 与真车一致：每次可用性询问都回开始会话。
                         # LOCALWARP_IAP2_CARPLAY_SESSION=0 用于对照实验（只画像不开会话）
-                        if os.environ.get("LOCALWARP_IAP2_CARPLAY_SESSION", "1") != "0":
+                        if (self.carplay and os.environ.get(
+                                "LOCALWARP_IAP2_CARPLAY_SESSION", "1") != "0"):
                             await self.link.send(carplay_start_session_message())
                             carplay_sessions_started += 1
                             self.emit(event="carplay_session_started",
@@ -844,8 +878,11 @@ class AccessoryLocationSession:
                                   sentences=sorted(active),
                                   intervals=peer_intervals)
                     elif message.identifier == MSG_LOCATION_STOP:
-                        active.clear()
-                        self.emit(event="location_stopped")
+                        # 保护机制：手机在锁屏、后台或低功耗下会发 MSG_LOCATION_STOP (0xFFFC)。
+                        # 若完全清空 active，手机将由于缺少外设数据输入而回退至基站/Wi-Fi 真实位置。
+                        # 因此仅记录状态事件，保持 active 集合或降级为基础 GGA/RMC 心跳维持，
+                        # 确保 CarPlay LIVI 会话持续提供目标坐标，防止蓝点漂移回真实位置。
+                        self.emit(event="location_stopped_keepalive")
                 if send and summary.identified and summary.authenticated and active:
                     now = asyncio.get_running_loop().time()
                     due = sorted(
@@ -858,7 +895,7 @@ class AccessoryLocationSession:
                         sentences = location_sentences(target.latitude, target.longitude)
                         payload = [sentences[i] for i in due]
                         if 1 in due:
-                            # GGA 在发时附带星座细节（GSA/GSV）抬高完整性评级
+                            # GGA 在发时附带与卫星数一致的星座细节（GSA/GSV）
                             payload += supplementary_sentences()
                         await self.link.send(location_message(payload))
                         last_sent.update({i: now for i in due})
@@ -907,7 +944,8 @@ async def _run(args: argparse.Namespace) -> None:
         link = Iap2Link(stream, _emit_json)
         await link.handshake()
         identity = _resolve_identity(args)
-        session = AccessoryLocationSession(link, identity, _emit_json)
+        session = AccessoryLocationSession(
+            link, identity, _emit_json, carplay=args.profile == "carplay")
         summary = await session.run(
             args.latitude if args.command == "send" else None,
             args.longitude if args.command == "send" else None,
@@ -930,6 +968,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     for name in ("probe", "send"):
         command = commands.add_parser(name)
+        command.add_argument("--profile", choices=("carplay", "location"),
+                             default="carplay")
         command.add_argument("--cert-file", help="DER PKCS#7 certificate container")
         command.add_argument("--key-file", help="unencrypted DER PKCS#8 P-256 key")
         command.add_argument("--duration", type=float,

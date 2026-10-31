@@ -14,19 +14,27 @@ docs/research/enhanced-location-acceptance-2026-10-25.md 第四轮）：
 TLS 采用 MemoryBIO 手动握手 + ClientHello SNI 解析：不依赖各解释器
 sni_callback 行为差异（部分构建不支持回调返回上下文），Mac/Windows 表现一致。
 
-安全边界：只劫持 HIJACK_HOSTS 中的两个精确域名，其余查询原样转发上游，
+安全边界：rewrite 只改写 HIJACK_HOSTS 两个域名；suppress 仅匹配
+SUPPRESS_HOSTS 中显式列出的定位端点，其余查询原样转发上游，
 不解析、不记录；443 仅接受 SNI 为劫持域名的 TLS，仅响应 POST /clls/wloc。
 端口 53/443 在 Unix 上为特权端口，产品化由安装期的特权助手持有；
 测试可用构造参数改用高位端口。
 """
 import asyncio
+from collections import OrderedDict
 import ipaddress
 import math
 import os
+import random
+import re
 import socket
 import ssl
 import struct
+import subprocess
+import sys
+import time
 from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
 
 try:
     from wloc_proxy import (HOSTS, CertificateStore, build_response,  # noqa: F401
@@ -38,6 +46,24 @@ except ImportError:
                                         fields as pb_fields)
 
 HIJACK_HOSTS = HOSTS
+
+
+# Explicit DNS names observed alongside renewed external reference fixes on the
+# iOS 27.2 test device. This is a working test policy, not a proven minimum set.
+SUPPRESS_HOSTS = frozenset(HIJACK_HOSTS) | frozenset({
+    'cl2.apple.com', 'cl2-cn.apple.com', 'cl3.apple.com',
+    'cl4.apple.com', 'cl4-cn.apple.com', 'iphone-ld.apple.com',
+    'cl2-cdn-cn.origin-apple.com.akadns.net',
+    'cl3-cn.origin-apple.com.akadns.net',
+    'cl2-cn.apple.com.w.cdngslb.com',
+})
+
+
+def is_suppressed_domain(name: str) -> bool:
+    """Match observed location endpoints exactly; preserve other map services."""
+    return name.lower().rstrip('.') in SUPPRESS_HOSTS
+
+
 STEPS = ['download_ca', 'trust_ca', 'configure_dns', 'verify_maps']
 SUPPRESS_STEPS = ['configure_dns', 'toggle_location', 'verify_maps']
 MAX_BODY = 256 * 1024
@@ -47,8 +73,9 @@ FALLBACK_UPSTREAMS = ('223.5.5.5', '119.29.29.29')
 def constraint_text(mode='rewrite'):
     if mode == 'suppress':
         return ('Start the USB accessory session, set Wi-Fi DNS to this computer, '
-                'enable Airplane Mode (keep Wi-Fi on), then toggle Location Services once. '
-                'Verified on iOS 27.2: far-distance fixes are adopted reliably. '
+                'enable Airplane Mode with Wi-Fi on, then toggle Location Services once. '
+                'Verify DNS queries and suppression counters. Cached references and GNSS can still '
+                'reject accessory fixes; far-distance adoption is not guaranteed. '
                 'Restore DNS to Automatic and disable Airplane Mode when finished.')
     return ('Set the phone Wi-Fi DNS to this computer, trust the LocalWarp CA, '
             'then toggle Location Services once. Verified on iOS 26.6.1: the '
@@ -58,24 +85,352 @@ def constraint_text(mode='rewrite'):
             'Ports 53/443 need elevation on macOS; not on Windows.')
 
 
-def system_nameservers():
-    """读取系统解析器（去除自指/回环），失败时用公共上游。"""
+def normalize_upstream(upstream) -> Tuple[str, int]:
+    """标准化上游地址格式为 ('ip', port)。"""
+    if isinstance(upstream, tuple) and len(upstream) == 2:
+        return (str(upstream[0]), int(upstream[1]))
+    if isinstance(upstream, str) and ':' in upstream:
+        host, port = upstream.rsplit(':', 1)
+        try:
+            return (host, int(port))
+        except ValueError:
+            pass
+    return (str(upstream), 53)
+
+
+def discover_system_nameservers(lan_ip=None, local_port=53) -> Tuple[str, ...]:
+    """跨平台可靠发现系统有效 DNS，排除回环、本机地址并兜底。"""
     servers = []
+
+    # 1. macOS: 优先查询 scutil --dns 获取经过配置的有效 Nameserver
+    if sys.platform == 'darwin':
+        try:
+            res = subprocess.run(['scutil', '--dns'], capture_output=True, text=True, timeout=1.5)
+            if res.returncode == 0:
+                for line in res.stdout.splitlines():
+                    line = line.strip()
+                    m = re.match(r'nameserver\[\d+\]\s*:\s*([0-9a-fA-F\.\:]+)', line)
+                    if m:
+                        ip_str = m.group(1)
+                        try:
+                            ip = ipaddress.ip_address(ip_str)
+                            if ip.version == 4 and not ip.is_loopback and not ip.is_link_local and not ip.is_unspecified:
+                                servers.append(str(ip))
+                        except ValueError:
+                            pass
+        except Exception:
+            pass
+
+    # 2. Windows: 优先通过 powershell 查询活动网络适配器的 DNS
+    elif sys.platform == 'win32':
+        try:
+            res = subprocess.run(
+                ['powershell', '-NoProfile', '-Command',
+                 'Get-DnsClientServerAddress -AddressFamily IPv4 | Select-Object -ExpandProperty ServerAddresses'],
+                capture_output=True, text=True, timeout=2.0)
+            if res.returncode == 0:
+                for line in res.stdout.splitlines():
+                    ip_str = line.strip()
+                    try:
+                        ip = ipaddress.ip_address(ip_str)
+                        if ip.version == 4 and not ip.is_loopback and not ip.is_link_local and not ip.is_unspecified:
+                            servers.append(str(ip))
+                    except ValueError:
+                        pass
+        except Exception:
+            pass
+
+    # 3. 回退读取 /etc/resolv.conf
+    if not servers:
+        try:
+            for line in Path('/etc/resolv.conf').read_text().splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and parts[0] == 'nameserver':
+                    address = parts[1]
+                    try:
+                        parsed = ipaddress.ip_address(address)
+                        if parsed.version == 4 and not parsed.is_loopback and not parsed.is_link_local and not parsed.is_unspecified:
+                            servers.append(address)
+                    except ValueError:
+                        continue
+        except OSError:
+            pass
+
+    # 防环机制：排除本机 LAN IP、回环及自身监听端口
+    filtered = []
+    for s in dict.fromkeys(servers):
+        if lan_ip and s == lan_ip:
+            continue
+        filtered.append(s)
+
+    # 保留公共上游作为后备兜底（保持优先级：系统DNS优先，再公共兜底）
+    combined = list(dict.fromkeys(filtered + list(FALLBACK_UPSTREAMS)))
+    return tuple(combined)
+
+
+def system_nameservers():
+    """向后兼容接口：获取当前系统解析器。"""
+    return discover_system_nameservers()
+
+
+def parse_dns_ttls(data: bytes, qend: int) -> Tuple[Optional[int], List[int]]:
+    """解析 Answer 节的最小 TTL 及各 Answer 记录中 TTL 字段在字节流中的偏移量。
+
+    遵守 RFC 1035 / RFC 2181 / RFC 2308：
+    - 若出现截断标志 (TC=1) 或 SERVFAIL/FORMERR，返回 (None, []) 表示不可缓存。
+    - 若为负应答 (NXDOMAIN 或 NODATA)，返回默认负缓存 TTL 15s。
+    - 若有有效 Answer，返回最小 TTL (范围限制 5s ~ 3600s) 及所有 TTL 字节偏移。
+    """
+    if len(data) < 12:
+        return None, []
+    flags, qdcount, ancount = struct.unpack('>HHH', data[2:8])
+    rcode = flags & 0x0F
+    is_truncated = bool(flags & 0x0200)
+    if is_truncated or rcode in (1, 2, 4, 5):
+        return None, []
+    if ancount == 0:
+        return 15, []
+
+    pos = qend
+    ttls = []
+    offsets = []
+    data_len = len(data)
     try:
-        for line in Path('/etc/resolv.conf').read_text().splitlines():
-            parts = line.split()
-            if len(parts) >= 2 and parts[0] == 'nameserver':
-                address = parts[1]
-                try:
-                    parsed = ipaddress.ip_address(address)
-                except ValueError:
-                    continue
-                if parsed.version == 4 and not parsed.is_loopback:
-                    servers.append(address)
-    except OSError:
+        for _ in range(ancount):
+            if pos >= data_len:
+                return None, []
+            # 跳过 NAME
+            if data[pos] & 0xC0 == 0xC0:
+                pos += 2
+            else:
+                while pos < data_len and data[pos] != 0:
+                    if data[pos] & 0xC0 == 0xC0:
+                        pos += 2
+                        break
+                    pos += 1 + data[pos]
+                else:
+                    pos += 1
+            if pos + 10 > data_len:
+                return None, []
+            rr_type, rr_class, rr_ttl, rdlength = struct.unpack('>HHIH', data[pos:pos+10])
+            offsets.append(pos + 4)
+            ttls.append(rr_ttl)
+            pos += 10 + rdlength
+        if not ttls:
+            return None, []
+        min_ttl = max(5, min(min(ttls), 3600))
+        return min_ttl, offsets
+    except Exception:
+        return None, []
+
+
+class DnsCacheEntry:
+    __slots__ = ('payload', 'expire_at', 'ttl_offsets', 'min_ttl', 'is_negative')
+
+    def __init__(self, payload: bytes, expire_at: float, ttl_offsets: List[int],
+                 min_ttl: int, is_negative: bool = False):
+        self.payload = payload
+        self.expire_at = expire_at
+        self.ttl_offsets = ttl_offsets
+        self.min_ttl = min_ttl
+        self.is_negative = is_negative
+
+
+class DnsCache:
+    """轻量级、有容量上限的内存 DNS TTL 缓存。"""
+
+    def __init__(self, max_entries: int = 2048):
+        self.max_entries = max_entries
+        self.entries: OrderedDict[Tuple[str, int, int], DnsCacheEntry] = OrderedDict()
+        self.hits: int = 0
+        self.misses: int = 0
+
+    def get(self, query: bytes, name: str, qtype: int, qclass: int) -> Optional[bytes]:
+        key = (name.lower().rstrip('.'), qtype, qclass)
+        entry = self.entries.get(key)
+        if entry is None:
+            self.misses += 1
+            return None
+        now = time.monotonic()
+        if entry.expire_at <= now:
+            del self.entries[key]
+            self.misses += 1
+            return None
+
+        self.entries.move_to_end(key)
+        self.hits += 1
+
+        remaining_ttl = max(1, int(entry.expire_at - now))
+        reply = bytearray(entry.payload)
+        # 严格替换为当前请求的 Transaction ID，绝不冲突
+        reply[:2] = query[:2]
+        # 动态更新各 Answer RR 的剩余 TTL，避免下游 TTL 膨胀
+        for off in entry.ttl_offsets:
+            if off + 4 <= len(reply):
+                reply[off:off+4] = struct.pack('>I', remaining_ttl)
+        return bytes(reply)
+
+    def set(self, name: str, qtype: int, qclass: int, response: bytes, qend: int):
+        clean_name = name.lower().rstrip('.')
+        # 红线防守：定位劫持与抑制域名绝对不能进入普通缓存
+        if is_suppressed_domain(clean_name) or clean_name in HIJACK_HOSTS:
+            return
+
+        min_ttl, offsets = parse_dns_ttls(response, qend)
+        if min_ttl is None:
+            return
+
+        key = (clean_name, qtype, qclass)
+        now = time.monotonic()
+        expire_at = now + min_ttl
+
+        if len(self.entries) >= self.max_entries:
+            self.entries.popitem(last=False)
+
+        self.entries[key] = DnsCacheEntry(
+            payload=response,
+            expire_at=expire_at,
+            ttl_offsets=offsets,
+            min_ttl=min_ttl,
+            is_negative=(offsets == []),
+        )
+
+    def clear(self):
+        self.entries.clear()
+
+    def __len__(self):
+        return len(self.entries)
+
+
+class UpstreamUdpClient(asyncio.DatagramProtocol):
+    """复用单个 UDP Socket 的上游解析客户端，消除每次查询创建 Socket 的系统开销。"""
+
+    def __init__(self):
+        self.transport: Optional[asyncio.DatagramTransport] = None
+        self._pending: Dict[Tuple[str, int, int], Tuple[asyncio.Future, Optional[bytes]]] = {}
+        self._next_id: int = random.randint(1, 1000)
+
+    def connection_made(self, transport: asyncio.DatagramTransport):
+        self.transport = transport
+
+    def datagram_received(self, data: bytes, addr: Tuple[str, int]):
+        if len(data) < 2:
+            return
+        txid = struct.unpack('>H', data[:2])[0]
+        # 1. 尝试精确匹配 (addr, port, txid)
+        key = (addr[0], addr[1], txid)
+        entry = self._pending.pop(key, None)
+        if entry:
+            fut, orig_txid = entry
+            if not fut.done():
+                resp = (orig_txid + data[2:]) if orig_txid else data
+                fut.set_result(resp)
+            return
+
+        # 2. 回退匹配（针对非标准 DNS 测试 mock 或无 ID 回显的上游）
+        fallback_key = next((k for k in self._pending if k[0] == addr[0] and k[1] == addr[1]), None)
+        if fallback_key:
+            fut, _ = self._pending.pop(fallback_key)
+            if not fut.done():
+                fut.set_result(data)
+
+    def error_received(self, error: Exception):
         pass
-    unique = list(dict.fromkeys(servers))
-    return tuple(unique) or FALLBACK_UPSTREAMS
+
+    async def query_one(self, remote: Tuple[str, int], query: bytes,
+                        timeout: float = 2.0) -> Optional[bytes]:
+        if not self.transport or self.transport.is_closing():
+            return None
+        loop = asyncio.get_running_loop()
+
+        orig_txid = query[:2]
+        orig_id_int = struct.unpack('>H', orig_txid)[0]
+        primary_key = (remote[0], remote[1], orig_id_int)
+
+        if primary_key not in self._pending:
+            # 无冲突：原样发包
+            fut = loop.create_future()
+            self._pending[primary_key] = (fut, None)
+            out_packet = query
+            assigned_key = primary_key
+        else:
+            # 存在并发相同 ID：分配内部隔离 ID
+            for _ in range(200):
+                txid = self._next_id
+                self._next_id = (self._next_id % 65535) + 1
+                key = (remote[0], remote[1], txid)
+                if key not in self._pending:
+                    break
+            else:
+                return None
+            fut = loop.create_future()
+            self._pending[key] = (fut, orig_txid)
+            out_packet = struct.pack('>H', txid) + query[2:]
+            assigned_key = key
+
+        try:
+            self.transport.sendto(out_packet, remote)
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except (asyncio.TimeoutError, OSError):
+            return None
+        finally:
+            self._pending.pop(assigned_key, None)
+
+    def close(self):
+        if self.transport and not self.transport.is_closing():
+            self.transport.close()
+            self.transport = None
+        for fut, _ in list(self._pending.values()):
+            if not fut.done():
+                fut.cancel()
+        self._pending.clear()
+
+
+class UpstreamManager:
+    """管理上游 DNS 地址、自动发现与快速故障转移。"""
+
+    def __init__(self, initial_upstreams=None, lan_ip=None, local_port=53):
+        self.lan_ip = lan_ip
+        self.local_port = local_port
+        self._manual_upstreams = (
+            [normalize_upstream(u) for u in initial_upstreams]
+            if initial_upstreams else None)
+        self._discovered: Tuple[Tuple[str, int], ...] = ()
+        self._last_discovery: float = 0.0
+        self._failures: Dict[Tuple[str, int], Tuple[int, float]] = {}
+
+    def refresh(self, force: bool = False):
+        now = time.monotonic()
+        if (force or self._manual_upstreams is None) and (
+                now - self._last_discovery > 60.0 or not self._discovered):
+            raw = discover_system_nameservers(lan_ip=self.lan_ip, local_port=self.local_port)
+            self._discovered = tuple(normalize_upstream(u) for u in raw)
+            self._last_discovery = now
+
+    def get_ordered_upstreams(self) -> List[Tuple[str, int]]:
+        self.refresh()
+        base = (self._manual_upstreams if self._manual_upstreams is not None
+                else list(self._discovered))
+        now = time.monotonic()
+        healthy = []
+        penalized = []
+        for u in base:
+            fails, penalty_until = self._failures.get(u, (0, 0.0))
+            if now < penalty_until:
+                penalized.append(u)
+            else:
+                healthy.append(u)
+        return healthy + penalized
+
+    def record_success(self, upstream: Tuple[str, int]):
+        self._failures.pop(upstream, None)
+
+    def record_failure(self, upstream: Tuple[str, int]):
+        now = time.monotonic()
+        fails, _ = self._failures.get(upstream, (0, 0.0))
+        fails += 1
+        penalty = (now + 30.0) if fails >= 2 else 0.0
+        self._failures[upstream] = (fails, penalty)
 
 
 # ---------------------------------------------------------------------------
@@ -125,34 +480,49 @@ def servfail(query, question_end):
     return dns_answer(query, question_end, rcode=2)
 
 
-async def forward_udp(query, upstreams, timeout=2.0):
-    """原样转发查询；upstream 可为 'ip' 或 ('ip', port)（测试用高位端口）。"""
-    loop = asyncio.get_running_loop()
-    for upstream in upstreams:
-        remote = upstream if isinstance(upstream, tuple) else (upstream, 53)
-        done = loop.create_future()
+async def forward_udp(query, upstreams, timeout=2.0, client=None, upstream_mgr=None):
+    """原样转发查询；支持复用客户端与故障转移。"""
+    norm_upstreams = [normalize_upstream(u) for u in upstreams]
+    for remote in norm_upstreams:
+        resp = None
+        # 1. 优先尝试复用 UDP 客户端
+        if client and getattr(client, 'transport', None):
+            resp = await client.query_one(remote, query, timeout=timeout)
+        # 2. 回退到直接独立 Socket
+        if resp is None:
+            loop = asyncio.get_running_loop()
+            done = loop.create_future()
 
-        class Relay(asyncio.DatagramProtocol):
-            def datagram_received(self, data, addr):
-                if not done.done():
-                    done.set_result(data)
+            class Relay(asyncio.DatagramProtocol):
+                def datagram_received(self, data, addr):
+                    if not done.done():
+                        done.set_result(data)
 
-            def error_received(self, error):
-                if not done.done():
-                    done.set_exception(error)
+                def error_received(self, error):
+                    if not done.done():
+                        done.set_exception(error)
 
-        try:
-            transport, _ = await loop.create_datagram_endpoint(
-                lambda: Relay(), remote_addr=remote)
-        except OSError:
-            continue
-        try:
-            transport.sendto(query)
-            return await asyncio.wait_for(done, timeout)
-        except (asyncio.TimeoutError, OSError):
-            continue
-        finally:
-            transport.close()
+            try:
+                transport, _ = await loop.create_datagram_endpoint(
+                    lambda: Relay(), remote_addr=remote)
+            except OSError:
+                if upstream_mgr:
+                    upstream_mgr.record_failure(remote)
+                continue
+            try:
+                transport.sendto(query)
+                resp = await asyncio.wait_for(done, timeout)
+            except (asyncio.TimeoutError, OSError):
+                if upstream_mgr:
+                    upstream_mgr.record_failure(remote)
+                continue
+            finally:
+                transport.close()
+
+        if resp is not None:
+            if upstream_mgr:
+                upstream_mgr.record_success(remote)
+            return resp
     return None
 
 
@@ -374,53 +744,129 @@ class DnsLocationError(Exception):
 
 class DnsLocationManager:
     def __init__(self, store_root=None, dns_port=53, tls_port=443,
-                 upstreams=None):
+                 upstreams=None, auth_guard=None):
         self.store = CertificateStore(store_root)
         self.dns_port = dns_port
         self.tls_port = tls_port
-        self.upstreams = tuple(upstreams) if upstreams else FALLBACK_UPSTREAMS
+        self.lan_ip = self.detect_lan_ip()
+        self.upstream_mgr = UpstreamManager(
+            initial_upstreams=upstreams,
+            lan_ip=self.lan_ip,
+            local_port=self.dns_port)
+        # 兼容性属性：对外暴露当前主上游列表（字符串表示）
+        self.upstreams = tuple(str(u[0]) if u[1] == 53 else f'{u[0]}:{u[1]}'
+                               for u in self.upstream_mgr.get_ordered_upstreams())
+        self.auth_guard = auth_guard
         self.lock = asyncio.Lock()
         self.server = None
         self.target = None
-        self.lan_ip = None
         self.contexts = {}
         self.clients = set()
         self.mode = 'rewrite'
         self.sinkhole = None
+        self.cache = DnsCache(max_entries=2048)
+        self.upstream_client = None
+        self.debug_log = os.getenv("LOCALWARP_DNS_DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
+        self._log_queue = asyncio.Queue(maxsize=2000) if self.debug_log else None
+        self._log_task = None
         self.diagnostics = self._fresh_diagnostics()
+
+    def _check_auth(self):
+        if self.auth_guard is None:
+            return True
+        return self.auth_guard()
 
     @staticmethod
     def _fresh_diagnostics():
         return dict(dns_queries=0, dns_hijacked=0, dns_suppressed=0, dns_forwarded=0,
-                    dns_failed=0, tls_conn=0, sni_refused=0,
+                    dns_failed=0, cache_hits=0, cache_misses=0, upstream_queries=0,
+                    cache_size=0, tls_conn=0, sni_refused=0,
                     wloc_requests=0, strict=0, tolerant=0, empty=0,
-                    errors=0, last_error_code=None)
+                    errors=0, last_error_code=None, recent_queries=[])
+
+    def _log_query(self, now_str: str, action: str, name: str, qtype: int):
+        if not self.debug_log or self._log_queue is None:
+            return
+        line = f'{now_str} [{action.upper():10s}] {name:<45s} (qtype={qtype})\n'
+        try:
+            self._log_queue.put_nowait(line)
+        except (asyncio.QueueFull, Exception):
+            pass
+
+    async def _log_flusher(self):
+        log_path = Path('/tmp/localwarp-dns-queries.log')
+        while True:
+            try:
+                line = await self._log_queue.get()
+                batch = [line]
+                while not self._log_queue.empty() and len(batch) < 50:
+                    batch.append(self._log_queue.get_nowait())
+                if log_path.exists() and log_path.stat().st_size > 5 * 1024 * 1024:
+                    log_path.write_text('')
+                with open(log_path, 'a', encoding='utf-8') as f:
+                    f.writelines(batch)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                await asyncio.sleep(0.5)
 
     @property
     def running(self):
         return getattr(self, 'dns_tcp', None) is not None
 
+    @property
+    def active(self):
+        return self.running and self.target is not None
+
     @staticmethod
     def detect_lan_ip():
-        """返回一个非 link-local 的本机 IPv4（探测 UDP 路由，不实际发包）。"""
-        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        """返回一个非 link-local 的本机 IPv4（探测 UDP 路由，不实际发包，并回退网卡枚举）。"""
+        for target in (('223.5.5.5', 53), ('1.1.1.1', 53), ('192.0.2.1', 9)):
+            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                probe.connect(target)
+                ip = probe.getsockname()[0]
+                if ip and not ip.startswith('127.') and not ip.startswith('169.254.'):
+                    return ip
+            except OSError:
+                pass
+            finally:
+                probe.close()
         try:
-            probe.connect(('223.5.5.5', 53))
-            return probe.getsockname()[0]
-        except OSError:
-            return None
-        finally:
-            probe.close()
+            from .wloc_proxy import lan_ips
+            ips = lan_ips()
+            for ip in ips:
+                if not ip.startswith('169.254.') and not ip.startswith('127.'):
+                    return ip
+            if ips:
+                return ips[0]
+        except Exception:
+            pass
+        return None
 
     def status(self):
+        if not self.lan_ip:
+            detected = self.detect_lan_ip()
+            if detected:
+                self.lan_ip = detected
+                if hasattr(self, 'upstream_mgr') and self.upstream_mgr:
+                    self.upstream_mgr.lan_ip = detected
         cert = getattr(self.store, 'cert', None) if self.mode == 'rewrite' else None
-        return dict(running=self.running, mode=self.mode, sinkhole_ip=self.sinkhole,
+        diag = dict(self.diagnostics)
+        diag['cache_hits'] = self.cache.hits
+        diag['cache_misses'] = self.cache.misses
+        diag['cache_size'] = len(self.cache)
+        current_upstreams = [str(u[0]) if u[1] == 53 else f'{u[0]}:{u[1]}'
+                             for u in self.upstream_mgr.get_ordered_upstreams()]
+        return dict(running=self.running, active=self.active, mode=self.mode, sinkhole_ip=self.sinkhole,
                     tls_listening=self.server is not None, requires_ca=self.mode == 'rewrite',
-                    ios27_hint='iOS >=27: use accessory + DNS suppress (device-verified); rewrite mode is blocked by cert pinning.',
+                    ios27_hint='iOS >=27: accessory + DNS suppression is experimental; verify NMEA screening, IntegrityMonitor and the map during an active session.',
                     listen_dns_port=self.dns_port,
                     listen_tls_port=self.tls_port, lan_ip=self.lan_ip,
                     hijack_hosts=sorted(HIJACK_HOSTS),
-                    upstreams=list(self.upstreams),
+                    suppressed_hosts=(sorted(SUPPRESS_HOSTS)
+                                      if self.mode == 'suppress' else []),
+                    upstreams=current_upstreams,
                     target=self.target, phone_location_verified=False,
                     phone_steps=SUPPRESS_STEPS if self.mode == 'suppress' else STEPS,
                     constraint=constraint_text(self.mode),
@@ -428,54 +874,85 @@ class DnsLocationManager:
                         __import__('cryptography.hazmat.primitives.hashes',
                                    fromlist=['SHA256']).SHA256()).hex().upper()
                         if cert else None),
-                    diagnostics=dict(self.diagnostics))
+                    diagnostics=diag)
 
-    async def prepare(self):
+    async def prepare(self, mode='rewrite'):
+        """Make DNS usable before phone setup, without applying a target policy."""
         async with self.lock:
-            await asyncio.to_thread(self.store.ensure)
+            await self._prepare(mode)
             return self.status()
 
-    async def start(self, latitude, longitude, mode='rewrite'):
+    async def _prepare(self, mode):
+        # Caller holds the lifecycle lock. Re-entry must not reset active policy.
         if mode not in ('rewrite', 'suppress'):
             raise ValueError('mode must be rewrite or suppress')
+        if self.running:
+            if self.mode != mode:
+                raise DnsLocationError('stop DNS before switching modes')
+            return
+        sinkhole = str(ipaddress.IPv4Address(os.getenv('LOCALWARP_DNS_SINKHOLE', '0.0.0.0'))) if mode == 'suppress' else None
+        lan_ip = self.detect_lan_ip()
+        if not lan_ip:
+            raise DnsLocationError('no LAN IPv4 address found')
+        self.lan_ip = lan_ip
+        self.upstream_mgr.lan_ip = lan_ip
+        self.mode = mode
+        self.sinkhole = sinkhole
+        self.target = None
+        self.diagnostics = self._fresh_diagnostics()
+        self.contexts = {}
+        self.cache.clear()
+        if mode == 'rewrite':
+            await asyncio.to_thread(self.store.ensure)
+            self.contexts = {host: await asyncio.to_thread(
+                self.store.tls_context, host) for host in HIJACK_HOSTS}
+        try:
+            loop = asyncio.get_running_loop()
+            # 启动长生命周期的上游复用 UDP 客户端
+            if self.upstream_client is None:
+                client = UpstreamUdpClient()
+                try:
+                    transport, _ = await loop.create_datagram_endpoint(
+                        lambda: client, local_addr=('0.0.0.0', 0))
+                    self.upstream_client = client
+                except OSError:
+                    self.upstream_client = None
+
+            if self.debug_log and self._log_task is None and self._log_queue is not None:
+                self._log_task = loop.create_task(self._log_flusher())
+
+            self.udp_transport, _ = await loop.create_datagram_endpoint(
+                self._udp_factory, local_addr=('0.0.0.0', self.dns_port))
+            self.dns_tcp = await asyncio.start_server(
+                self._accept_tcp_dns, '0.0.0.0', self.dns_port)
+            if mode == 'rewrite':
+                self.server = await asyncio.start_server(
+                    self._accept_tls, '0.0.0.0', self.tls_port)
+        except OSError as error:
+            await self._close_listeners()
+            raise DnsLocationError(
+                f'cannot bind required ports for {mode} (DNS {self.dns_port}, TLS {self.tls_port}): '
+                f'{error}') from error
+
+    async def start(self, latitude, longitude, mode='rewrite'):
         if not (math.isfinite(latitude) and math.isfinite(longitude)
                 and -90 <= latitude <= 90 and -180 <= longitude <= 180):
             raise ValueError('invalid coordinates')
-        sinkhole = str(ipaddress.IPv4Address(os.getenv('LOCALWARP_DNS_SINKHOLE', '0.0.0.0'))) if mode == 'suppress' else None
         async with self.lock:
-            if self.running:
-                raise DnsLocationError('dns location session already running')
-            lan_ip = self.detect_lan_ip()
-            if not lan_ip:
-                raise DnsLocationError('no LAN IPv4 address found')
-            self.lan_ip = lan_ip
-            self.mode = mode
-            self.sinkhole = sinkhole
+            await self._prepare(mode)
             self.target = dict(latitude=latitude, longitude=longitude)
-            self.diagnostics = self._fresh_diagnostics()
-            self.contexts = {}
-            if mode == 'rewrite':
-                await asyncio.to_thread(self.store.ensure)
-                self.contexts = {host: await asyncio.to_thread(
-                    self.store.tls_context, host) for host in HIJACK_HOSTS}
-            try:
-                loop = asyncio.get_running_loop()
-                self.udp_transport, _ = await loop.create_datagram_endpoint(
-                    self._udp_factory, local_addr=('0.0.0.0', self.dns_port))
-                self.dns_tcp = await asyncio.start_server(
-                    self._accept_tcp_dns, '0.0.0.0', self.dns_port)
-                if mode == 'rewrite':
-                    self.server = await asyncio.start_server(
-                        self._accept_tls, '0.0.0.0', self.tls_port)
-            except OSError as error:
-                await self._close_listeners()
-                raise DnsLocationError(
-                    f'cannot bind required ports for {mode} (DNS {self.dns_port}, TLS {self.tls_port}): '
-                    f'{error}') from error
+            return self.status()
+
+    async def deactivate(self):
+        """Remove target policy while keeping the phone's DNS resolver usable."""
+        async with self.lock:
+            self.target = None
+            self.cache.clear()
             return self.status()
 
     async def stop(self):
         async with self.lock:
+            self.target = None
             await self._close_listeners()
             return self.status()
 
@@ -494,6 +971,17 @@ class DnsLocationManager:
         if transport:
             transport.close()
             self.udp_transport = None
+
+        if self.upstream_client:
+            self.upstream_client.close()
+            self.upstream_client = None
+
+        if self._log_task:
+            self._log_task.cancel()
+            self._log_task = None
+
+        self.cache.clear()
+
         # Close accepted streams before waiting for the servers to drain.
         for writer in list(self.clients):
             writer.close()
@@ -509,9 +997,15 @@ class DnsLocationManager:
                 self.transport = transport
 
             def datagram_received(self, data, addr):
+                def _safe_send(reply):
+                    if self.transport and not self.transport.is_closing():
+                        try:
+                            self.transport.sendto(reply, addr)
+                        except (OSError, AttributeError):
+                            pass
+
                 asyncio.get_running_loop().create_task(
-                    manager._answer_dns(data, lambda reply: (
-                        self.transport.sendto(reply, addr))))
+                    manager._answer_dns(data, _safe_send))
 
         return UdpDns()
 
@@ -555,16 +1049,59 @@ class DnsLocationManager:
                 return
             name, qtype, qclass, qend = parsed
             self.diagnostics['dns_queries'] += 1
-            if qclass == 1 and name in HIJACK_HOSTS:
-                self.diagnostics['dns_hijacked'] += 1
-                if self.mode == 'suppress':
-                    self.diagnostics['dns_suppressed'] += 1
-                answer_ip = self.sinkhole if self.mode == 'suppress' else self.lan_ip
-                send(hijack_answer(query, qend, qtype, answer_ip))
+            if self.active and not self._check_auth():
+                self.target = None
+            is_target = self.active and (is_suppressed_domain(name) if self.mode == 'suppress'
+                                        else name in HIJACK_HOSTS)
+            action = 'suppressed' if is_target else 'forwarded'
+            now_str = time.strftime('%H:%M:%S')
+
+            # 诊断与实时日志留存（保留最近 100 条汇总，不落敏感数据）
+            recent = self.diagnostics.setdefault('recent_queries', [])
+            recent.append(dict(time=now_str, name=name, qtype=qtype, action=action))
+            if len(recent) > 100:
+                del recent[:len(recent) - 100]
+
+            # 仅在开启 LOCALWARP_DNS_DEBUG 时异步写入文件
+            if self.debug_log:
+                self._log_query(now_str, action, name, qtype)
+
+            # 红线防守：定位目标绝对不走外部上游，绝对不进缓存
+            if is_target:
+                if qclass == 1:
+                    self.diagnostics['dns_hijacked'] += 1
+                    if self.mode == 'suppress':
+                        self.diagnostics['dns_suppressed'] += 1
+                    answer_ip = self.sinkhole if self.mode == 'suppress' else self.lan_ip
+                    send(hijack_answer(query, qend, qtype, answer_ip))
+                else:
+                    send(servfail(query, qend))
                 return
-            upstream = await forward_udp(query, self.upstreams)
+
+            # 普通域名查询：首先检查内存 TTL 缓存
+            cached_reply = self.cache.get(query, name, qtype, qclass)
+            if cached_reply is not None:
+                self.diagnostics['cache_hits'] = self.diagnostics.get('cache_hits', 0) + 1
+                self.diagnostics['dns_forwarded'] += 1
+                send(cached_reply)
+                return
+
+            self.diagnostics['cache_misses'] = self.diagnostics.get('cache_misses', 0) + 1
+            self.diagnostics['upstream_queries'] = self.diagnostics.get('upstream_queries', 0) + 1
+
+            # 向上游转发查询（优先系统 DNS 与复用 Socket，带快速故障转移）
+            effective_upstreams = (
+                self.upstream_mgr.get_ordered_upstreams()
+                if hasattr(self, 'upstream_mgr') else self.upstreams)
+            upstream = await forward_udp(
+                query,
+                effective_upstreams,
+                client=self.upstream_client,
+                upstream_mgr=getattr(self, 'upstream_mgr', None))
+
             if upstream is not None:
                 self.diagnostics['dns_forwarded'] += 1
+                self.cache.set(name, qtype, qclass, upstream, qend)
                 send(upstream)
             else:
                 self.diagnostics['dns_failed'] += 1
@@ -606,9 +1143,19 @@ class DnsLocationManager:
                                 b'\r\nConnection: close\r\n\r\n')
                 return
             body = await tls.readexactly(length, 15)
+            # 实时核验授权守卫：到期或撤销立即清空目标策略并拒绝服务，防止 DNS 缓存绕过
+            if self.active and not self._check_auth():
+                self.target = None
+            # Read policy after all request awaits: deactivation may have happened
+            # during the handshake/body read. No yield before writing this response.
+            target = self.target if self.active and self.mode == 'rewrite' else None
+            if target is None:
+                await tls.write(b'HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0'
+                                b'\r\nConnection: close\r\n\r\n')
+                return
             self.diagnostics['wloc_requests'] += 1
             response, mode = tolerant_response(
-                body, self.target['latitude'], self.target['longitude'])
+                body, target['latitude'], target['longitude'])
             self.diagnostics[mode] += 1
             await tls.write(b'HTTP/1.1 200 OK\r\nContent-Type: '
                             b'application/octet-stream\r\nContent-Length: '

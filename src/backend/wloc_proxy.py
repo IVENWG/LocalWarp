@@ -308,12 +308,13 @@ async def reply(writer, code, body=b'', content_type='text/plain'):
 
 
 class WlocProxy:
-    def __init__(self, directory=None, port=None, ca_port=28888):
+    def __init__(self, directory=None, port=None, ca_port=28888, auth_guard=None):
         self.store = CertificateStore(directory)
         self.port = int(port if port is not None else os.getenv('LOCALWARP_WLOC_PORT', '28889'))
         if not 0 <= self.port <= 65535:
             raise ValueError('invalid proxy port')
         self.ca_port = ca_port
+        self.auth_guard = auth_guard
         self.server = None
         self.ca_servers = []
         self.target = None
@@ -434,6 +435,10 @@ class WlocProxy:
             if not 0 < length <= MAX_BODY:
                 raise ValueError('invalid content length')
             body = await asyncio.wait_for(reader.readexactly(length), 10)
+            if self.auth_guard is not None and not self.auth_guard():
+                self.target = None
+                await reply(writer, '403 Forbidden')
+                return
             if not self.server or not self.target:
                 return
             stage = 'response'

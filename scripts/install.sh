@@ -177,12 +177,27 @@ EOF
     echo "[+] macOS launchd service configured and started!"
 fi
 
-# Health check
-sleep 2
-if command -v curl >/dev/null 2>&1 && curl -fsS --max-time 3 http://127.0.0.1:28888/health | grep -q '"healthy"'; then
+wait_for_connector_health() {
+    # launchd may take several seconds to spawn the bundled service after bootstrap.
+    # Wait for readiness so a successful install does not immediately print a false
+    # connection error while the service is still starting.
+    command -v curl >/dev/null 2>&1 || return 1
+    for ((attempt = 1; attempt <= 30; attempt++)); do
+        if curl -fs --max-time 1 http://127.0.0.1:28888/health | grep -q '"healthy"'; then
+            return 0
+        fi
+        if [ "${attempt}" -lt 30 ]; then
+            sleep 1
+        fi
+    done
+    return 1
+}
+
+if wait_for_connector_health; then
     echo ""
     echo "=================================================="
     echo "  🎉 LocalWarp Connector is ONLINE!              "
+    echo "  Return to the workbench to continue.           "
     echo "  Listening on: http://127.0.0.1:28888           "
     echo "  Web Studio:   https://localwarp.com/app        "
     echo "  Uninstall:                                     "
@@ -190,6 +205,7 @@ if command -v curl >/dev/null 2>&1 && curl -fsS --max-time 3 http://127.0.0.1:28
     echo "=================================================="
 else
     echo ""
-    echo "[!] Service registered. Check status: http://127.0.0.1:28888/health"
-    echo "[*] Logs: /tmp/localwarp-connector.log"
+    echo "[!] Connector installed but did not become ready within 30 seconds."
+    echo "[*] Return to the workbench and select Recheck."
+    echo "[*] If it remains offline, inspect /tmp/localwarp-connector.err"
 fi

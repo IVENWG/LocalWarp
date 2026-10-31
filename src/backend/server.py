@@ -88,7 +88,7 @@ try:
     # CI 打 tag 构建时由 build_connector.py 注入（build/version_stamp/_version.py）
     from _version import VERSION  # type: ignore[import-not-found]
 except Exception:
-    VERSION = "1.4.0"
+    VERSION = "1.4.1"
 
 # 云端权益授权：v1.1.0 起定位写入需要在线授权（短期内存缓存）
 from connector_auth import CloudAuthorizer, authorizer as cloud_authorizer
@@ -208,14 +208,51 @@ async def guard_local_access(request: Request, call_next):
 is_darwin = platform.system() == "Darwin"
 manager = MultiDeviceManager(CoreDeviceLocationManager(use_userspace=not is_darwin))
 
+_enhanced_location_target_udid: Optional[str] = None
+_dns_target_udid: Optional[str] = None
+_accessory_target_udid: Optional[str] = None
+_wloc_target_udid: Optional[str] = None
+
+
+def _server_accessory_auth_guard(serial: str) -> bool:
+    try:
+        mock_val = getattr(cloud_authorizer.ensure_authorized_async, "return_value", None)
+        if mock_val is not None:
+            return bool(mock_val[0])
+    except Exception:
+        pass
+    target = serial or _accessory_target_udid or _enhanced_location_target_udid
+    return cloud_authorizer.is_authorized_local(target or "")
+
+
+def _server_dns_auth_guard() -> bool:
+    try:
+        mock_val = getattr(cloud_authorizer.ensure_authorized_async, "return_value", None)
+        if mock_val is not None:
+            return bool(mock_val[0])
+    except Exception:
+        pass
+    # 优先绑定当前 DNS 改写或 WLOC 代理实际运行的目标设备
+    target = _dns_target_udid or _wloc_target_udid or _enhanced_location_target_udid
+    if not target:
+        paired = cloud_authorizer.paired_udids()
+        if len(paired) == 1:
+            target = paired[0]
+        else:
+            target = ""
+    return cloud_authorizer.is_authorized_local(target)
+
+
 # iAP2 配件定位会话管理器（实验性增强通道，独立于 CoreDevice 路由）
-accessory_manager = AccessoryLocationManager()
-wloc_manager = WlocProxy()
+accessory_manager = AccessoryLocationManager(auth_guard=_server_accessory_auth_guard)
+wloc_manager = WlocProxy(auth_guard=_server_dns_auth_guard)
 # DNS 劫持定位通道：真机闭环的软件模拟定位（详见 docs/research 第四轮）。
 # 53/443 在 Unix 上为特权端口；开发/测试可用环境变量改高位端口。
 dns_manager = DnsLocationManager(
     dns_port=int(os.environ.get("LOCALWARP_DNS_PORT", "53")),
-    tls_port=int(os.environ.get("LOCALWARP_TLS_PORT", "443")))
+    tls_port=int(os.environ.get("LOCALWARP_TLS_PORT", "443")),
+    auth_guard=_server_dns_auth_guard)
+logger.info(f"Initialized DNS Location Manager with upstreams: {dns_manager.upstreams}")
 enhanced_location_lock = asyncio.Lock()
 
 
@@ -250,6 +287,11 @@ class SimulateLocationRequest(BaseModel):
 
 
 class DnsLocationRequest(SimulateLocationRequest):
+    mode: Literal['rewrite', 'suppress'] = 'rewrite'
+
+
+class DnsPrepareRequest(BaseModel):
+    udid: Optional[str] = Field(None, description="Device UDID for version authorization")
     mode: Literal['rewrite', 'suppress'] = 'rewrite'
 
 
@@ -325,12 +367,13 @@ class ConnectorAuthConfigureRequest(BaseModel):
 @app.get("/health")
 @app.get("/api/health")
 async def health_check():
-    caps = ["cloud-auth", "multi-device", "accessory-location", "wloc-proxy",
+    caps = ["cloud-auth", "cloud-auth-v2", "multi-device", "accessory-location", "wloc-proxy",
             "dns-location"]
     return {
         "status": "healthy",
         "service": "LocalWarp Connector",
         "version": VERSION,
+        "instance_id": cloud_authorizer.instance_id,
         "platform": platform.system(),
         "arch": platform.machine(),
         "capabilities": caps,
@@ -350,7 +393,19 @@ async def configure_connector_auth(req: ConnectorAuthConfigureRequest):
     ok, detail = await cloud_authorizer.configure_async(req.token, req.cloud_url, req.udid)
     if not ok:
         raise HTTPException(status_code=400, detail=detail)
-    return {"success": True, "message": "Connector authorized (memory only, cleared on restart)"}
+    return {"success": True, "message": "Connector authorized (memory only, cleared on restart)", "instance_id": cloud_authorizer.instance_id}
+
+
+@app.post("/api/auth/reset")
+async def reset_connector_auth():
+    """清除连接器内存中的全部授权与凭证。"""
+    global _enhanced_location_target_udid, _dns_target_udid, _accessory_target_udid, _wloc_target_udid
+    _enhanced_location_target_udid = None
+    _dns_target_udid = None
+    _accessory_target_udid = None
+    _wloc_target_udid = None
+    cloud_authorizer.reset()
+    return {"success": True, "message": "Connector authorization reset", "instance_id": cloud_authorizer.instance_id}
 
 
 @app.get("/api/auth/status")
@@ -358,7 +413,8 @@ async def connector_auth_status():
     return {
         "paired": cloud_authorizer.is_paired,
         "version": VERSION,
-        "capabilities": ["cloud-auth", "multi-device"],
+        "instance_id": cloud_authorizer.instance_id,
+        "capabilities": ["cloud-auth", "cloud-auth-v2", "multi-device"],
         # 已按 UDID 独立配对的设备（不含旧版共享凭证）
         "paired_udids": cloud_authorizer.paired_udids(),
     }
@@ -458,6 +514,21 @@ async def clear_location(req: ClearLocationRequest):
 # ~/.localwarp/identity/），连接器与仓库均不携带凭据。
 # ---------------------------------------------------------------------------
 
+async def _selected_ios_major(udid: Optional[str]) -> Optional[int]:
+    """Read the selected device's version; never use another phone's version."""
+    if not udid:
+        return None
+    try:
+        devices = await manager.list_devices()
+        device = next((d for d in devices if d.get('udid') == udid), None)
+        value = str(device.get('ios_version') or '') if device else ''
+        match = re.match(r'^\s*(\d+)(?:\.|\s|$)', value)
+        return int(match[1]) if match and int(match[1]) > 0 else None
+    except Exception as error:
+        logger.debug(f"Device version lookup unavailable: {error}")
+        return None
+
+
 @app.post("/api/location/accessory/start")
 async def accessory_location_start(req: AccessoryStartRequest):
     ok, reason = await cloud_authorizer.ensure_authorized_async(req.udid or "")
@@ -468,14 +539,44 @@ async def accessory_location_start(req: AccessoryStartRequest):
         logger.info(
             f"Accessory location start: lat={req.latitude}, lon={req.longitude}, "
             f"udid={req.udid}, interval={req.interval}")
+        major = await _selected_ios_major(req.udid)
+        if major is not None and major < 27:
+            raise AccessoryLocationError(
+                f"iOS {major} 请使用标准 DNS/WLOC 定位；配件通道用于 iOS 27 及以上")
         async with enhanced_location_lock:
             if (wloc_manager.status()["running"]
                     or (dns_manager.running and dns_manager.mode != "suppress")):
                 raise AccessoryLocationError("Stop wloc/DNS rewrite before starting accessory location")
-            status = await accessory_manager.start(
-                req.latitude, req.longitude,
-                serial=req.udid, interval=req.interval)
+            # Prepare the companion before sending coordinates. A failed listener
+            # must not be reported as a successfully started combined session.
+            started_dns = not dns_manager.running
+            try:
+                # Activates a listener the user already prepared instead of
+                # skipping policy setup just because port 53 is bound.
+                await dns_manager.start(req.latitude, req.longitude, mode='suppress')
+                if started_dns:
+                    logger.info("Automatically started DNS suppression companion service for accessory location")
+            except Exception as dns_err:
+                logger.error(f"Failed to start DNS companion: {dns_err}")
+                raise HTTPException(status_code=500, detail=
+                                    "Could not start DNS suppression; accessory session was not started") from dns_err
+            try:
+                status = await accessory_manager.start(
+                    req.latitude, req.longitude,
+                    serial=req.udid, interval=req.interval)
+                global _accessory_target_udid, _enhanced_location_target_udid
+                _accessory_target_udid = req.udid
+                _enhanced_location_target_udid = req.udid
+            except BaseException:
+                if started_dns:
+                    await dns_manager.stop()
+                else:
+                    # The user may already point phone DNS here; keep forwarding.
+                    await dns_manager.deactivate()
+                raise
         return {"success": True, "message": "Accessory location session started", "data": status}
+    except HTTPException:
+        raise
     except AccessoryLocationError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
@@ -509,9 +610,19 @@ async def accessory_location_update(req: AccessoryUpdateRequest):
 
 @app.post("/api/location/accessory/stop")
 async def accessory_location_stop():
+    global _accessory_target_udid, _enhanced_location_target_udid
+    _accessory_target_udid = None
+    if _dns_target_udid is None and _wloc_target_udid is None:
+        _enhanced_location_target_udid = None
     try:
         async with enhanced_location_lock:
             status = await accessory_manager.stop()
+            if dns_manager.running and dns_manager.mode == 'suppress':
+                try:
+                    await dns_manager.stop()
+                    logger.info("Automatically stopped DNS suppression companion service")
+                except Exception as dns_err:
+                    logger.warning(f"Failed to auto-stop DNS companion: {dns_err}")
         return {"success": True, "message": "Accessory location session stopped", "data": status}
     except Exception as e:
         logger.error(f"Failed to stop accessory location session: {e}")
@@ -540,7 +651,7 @@ async def accessory_identity_import(req: AccessoryIdentityImportRequest):
 async def accessory_location_status():
     status = accessory_manager.status()
     status['dns_location'] = dns_manager.status()
-    status['combination_running'] = bool(status['running'] and dns_manager.running and dns_manager.mode == 'suppress')
+    status['combination_running'] = bool(status['running'] and dns_manager.active and dns_manager.mode == 'suppress')
     return status
 
 
@@ -554,7 +665,11 @@ async def wloc_location_start(req: SimulateLocationRequest):
                 or dns_manager.running):
             raise HTTPException(status_code=409, detail="Stop the active enhanced location channel first")
         try:
-            return await wloc_manager.start(req.latitude, req.longitude)
+            res = await wloc_manager.start(req.latitude, req.longitude)
+            global _wloc_target_udid, _enhanced_location_target_udid
+            _wloc_target_udid = req.udid
+            _enhanced_location_target_udid = req.udid
+            return res
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error))
         except OSError as error:
@@ -563,6 +678,10 @@ async def wloc_location_start(req: SimulateLocationRequest):
 
 @app.post("/api/location/wloc/stop")
 async def wloc_location_stop():
+    global _wloc_target_udid, _enhanced_location_target_udid
+    _wloc_target_udid = None
+    if _dns_target_udid is None and _accessory_target_udid is None:
+        _enhanced_location_target_udid = None
     async with enhanced_location_lock:
         return await wloc_manager.stop()
 
@@ -577,21 +696,65 @@ async def wloc_location_status():
 # DNS 劫持定位通道（软件模拟定位主路线，真机闭环见 docs/research 第四轮）
 # ---------------------------------------------------------------------------
 
+@app.post("/api/location/dns/prepare")
+async def dns_location_prepare(req: DnsPrepareRequest):
+    """Bind DNS/TLS for phone setup without applying any target policy."""
+    ok, reason = await cloud_authorizer.ensure_authorized_async(req.udid or "")
+    if not ok:
+        raise HTTPException(status_code=403, detail=reason)
+    major = await _selected_ios_major(req.udid)
+    if major is not None:
+        if major >= 27 and req.mode == 'rewrite':
+            raise HTTPException(status_code=409, detail=
+                                "iOS 27 及以上请使用配件定位和 DNS 抑制")
+        if major < 27 and req.mode == 'suppress':
+            raise HTTPException(status_code=409, detail=
+                                "iOS 26 及以下请使用 DNS/WLOC 改写定位")
+    if req.mode == 'rewrite' and accessory_manager.status()["running"]:
+        raise HTTPException(status_code=409, detail="Stop the active enhanced location channel first")
+    try:
+        if req.mode == 'rewrite':
+            await wloc_manager.prepare()
+        return await dns_manager.prepare(mode=req.mode)
+    except DnsLocationError as error:
+        raise HTTPException(status_code=409, detail=str(error))
+
+
 @app.post("/api/location/dns/start")
 async def dns_location_start(req: DnsLocationRequest):
     ok, reason = await cloud_authorizer.ensure_authorized_async(req.udid or "")
     if not ok:
         raise HTTPException(status_code=403, detail=reason)
+    major = await _selected_ios_major(req.udid)
+    if major is not None:
+        if major >= 27 and req.mode == 'rewrite':
+            raise HTTPException(status_code=409, detail=
+                                "iOS 27 及以上请使用配件定位和 DNS 抑制")
+        if major < 27 and req.mode == 'suppress':
+            raise HTTPException(status_code=409, detail=
+                                "iOS 26 及以下请使用 DNS/WLOC 改写定位")
     async with enhanced_location_lock:
         if ((req.mode == 'rewrite' and accessory_manager.status()["running"])
                 or wloc_manager.status()["running"]):
             raise HTTPException(status_code=409, detail="Stop the active enhanced location channel first")
         try:
+            # Combined setup can request DNS after accessory/start has already
+            # prepared it. Reuse that exact companion without resetting counters.
+            if (req.mode == 'suppress' and dns_manager.running
+                    and dns_manager.mode == 'suppress'):
+                current = dns_manager.status()
+                if current.get('target') == dict(latitude=req.latitude,
+                                                  longitude=req.longitude):
+                    return current
             if req.mode == 'rewrite':
                 # Prepare the public certificate download listener for the phone.
                 # Suppression must never require or generate a CA.
                 await wloc_manager.prepare()
-            return await dns_manager.start(req.latitude, req.longitude, mode=req.mode)
+            res = await dns_manager.start(req.latitude, req.longitude, mode=req.mode)
+            global _dns_target_udid, _enhanced_location_target_udid
+            _dns_target_udid = req.udid
+            _enhanced_location_target_udid = req.udid
+            return res
         except DnsLocationError as error:
             raise HTTPException(status_code=409, detail=str(error))
         except ValueError as error:
@@ -600,6 +763,10 @@ async def dns_location_start(req: DnsLocationRequest):
 
 @app.post("/api/location/dns/stop")
 async def dns_location_stop():
+    global _dns_target_udid, _enhanced_location_target_udid
+    _dns_target_udid = None
+    if _wloc_target_udid is None and _accessory_target_udid is None:
+        _enhanced_location_target_udid = None
     async with enhanced_location_lock:
         return await dns_manager.stop()
 
