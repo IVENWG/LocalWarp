@@ -704,7 +704,21 @@ class ManualTls:
 
     async def _read_plaintext(self, timeout):
         while True:
-            chunk = self.sslobj.read(16384)
+            try:
+                chunk = self.sslobj.read(16384)
+            except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
+                # MemoryBIO 是非阻塞的：握手刚结束时 inbio 里通常只有 TLS
+                # 握手记录，还没有应用数据，read() 会抛 WantRead。这不是错误，
+                # 与 handshake() 一样先把待发的 TLS 记录冲出去，再从 socket
+                # 补充密文重试；让异常冒泡会误杀每一个 WLOC 请求。
+                await self._flush()
+                data = await asyncio.wait_for(self.reader.read(16384), timeout)
+                if not data:
+                    raise ConnectionResetError('client closed')
+                self.inbio.write(data)
+                continue
+            except ssl.SSLZeroReturnError:
+                raise ConnectionResetError('client closed (close_notify)')
             if chunk:
                 self.plain.extend(chunk)
                 return
@@ -782,6 +796,7 @@ class DnsLocationManager:
                     dns_failed=0, cache_hits=0, cache_misses=0, upstream_queries=0,
                     cache_size=0, tls_conn=0, sni_refused=0,
                     wloc_requests=0, strict=0, tolerant=0, empty=0,
+                    mode_switches=0, last_mode=None,
                     errors=0, last_error_code=None, recent_queries=[])
 
     def _log_query(self, now_str: str, action: str, name: str, qtype: int):
@@ -882,13 +897,52 @@ class DnsLocationManager:
             await self._prepare(mode)
             return self.status()
 
+    async def _switch_mode(self, mode):
+        """Hot-switch rewrite <-> suppress without rebinding port 53.
+
+        Phones that already point their Wi-Fi DNS at this machine must keep
+        resolving throughout the switch (iOS 26 -> 27 / back, standard <->
+        enhanced). Only the answering policy, DNS cache and the optional TLS
+        listener change; DNS UDP/TCP listeners and the upstream client stay up.
+        """
+        sinkhole = (str(ipaddress.IPv4Address(
+            os.getenv('LOCALWARP_DNS_SINKHOLE', '0.0.0.0')))
+            if mode == 'suppress' else None)
+        lan_ip = self.detect_lan_ip() or self.lan_ip
+        # Assign every policy field before the first await: _answer_dns() reads
+        # these synchronously, so no query can observe a half-updated tuple.
+        self.mode = mode
+        self.sinkhole = sinkhole
+        self.lan_ip = lan_ip
+        self.upstream_mgr.lan_ip = lan_ip
+        self.cache.clear()
+        self.diagnostics['mode_switches'] = self.diagnostics.get('mode_switches', 0) + 1
+        self.diagnostics['last_mode'] = mode
+        if mode == 'rewrite' and not self.contexts:
+            await asyncio.to_thread(self.store.ensure)
+            self.contexts = {host: await asyncio.to_thread(
+                self.store.tls_context, host) for host in HIJACK_HOSTS}
+        if mode == 'rewrite' and self.server is None:
+            try:
+                self.server = await asyncio.start_server(
+                    self._accept_tls, '0.0.0.0', self.tls_port)
+            except OSError as error:
+                raise DnsLocationError(
+                    f'cannot bind TLS port {self.tls_port} during mode switch: '
+                    f'{error}') from error
+        elif mode == 'suppress' and self.server is not None:
+            old_server = self.server
+            self.server = None
+            old_server.close()
+            await old_server.wait_closed()
+
     async def _prepare(self, mode):
         # Caller holds the lifecycle lock. Re-entry must not reset active policy.
         if mode not in ('rewrite', 'suppress'):
             raise ValueError('mode must be rewrite or suppress')
         if self.running:
             if self.mode != mode:
-                raise DnsLocationError('stop DNS before switching modes')
+                await self._switch_mode(mode)
             return
         sinkhole = str(ipaddress.IPv4Address(os.getenv('LOCALWARP_DNS_SINKHOLE', '0.0.0.0'))) if mode == 'suppress' else None
         lan_ip = self.detect_lan_ip()

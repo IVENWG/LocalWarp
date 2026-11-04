@@ -374,7 +374,10 @@ class WlocProxy:
         validate_target(latitude, longitude)
         await self.prepare()
         if self.server:
-            raise ValueError('wloc session already running')
+            # Hot-switch: retarget the running listener instead of forcing the
+            # user to stop and restart the channel (or the connector).
+            self.target = dict(latitude=latitude, longitude=longitude)
+            return self.status()
         self.contexts = {host: await asyncio.to_thread(self.store.tls_context, host) for host in HOSTS}
         self.target = dict(latitude=latitude, longitude=longitude)
         self.diagnostics = self._new_diagnostics()

@@ -88,7 +88,7 @@ try:
     # CI 打 tag 构建时由 build_connector.py 注入（build/version_stamp/_version.py）
     from _version import VERSION  # type: ignore[import-not-found]
 except Exception:
-    VERSION = "1.4.1"
+    VERSION = "1.4.2"
 
 # 云端权益授权：v1.1.0 起定位写入需要在线授权（短期内存缓存）
 from connector_auth import CloudAuthorizer, authorizer as cloud_authorizer
@@ -445,6 +445,10 @@ async def simulate_location(req: SimulateLocationRequest):
     if not ok:
         logger.warning(f"Simulate denied by cloud authorization: {reason}")
         raise HTTPException(status_code=403, detail=reason)
+    # Standard <- enhanced is a hot switch handled by the connector: release
+    # any enhanced service instead of asking the user to stop it manually.
+    async with enhanced_location_lock:
+        await _release_conflicting_channels_locked()
     try:
         logger.info(f"Received simulate request: lat={req.latitude}, lon={req.longitude}, udid={req.udid}")
         result = await manager.simulate_location(
@@ -482,6 +486,8 @@ async def simulate_location_batch(req: BatchSimulateLocationRequest):
         except Exception as e:
             return {"udid": item.udid, "success": False, "error": str(e)}
 
+    async with enhanced_location_lock:
+        await _release_conflicting_channels_locked()
     results = list(await asyncio.gather(*(_run_one(item) for item in req.items)))
     succeeded = sum(1 for r in results if r.get("success"))
     failed = len(results) - succeeded
@@ -529,6 +535,60 @@ async def _selected_ios_major(udid: Optional[str]) -> Optional[int]:
         return None
 
 
+def _dns_mode_for_ios(major: Optional[int], requested: str) -> str:
+    """The selected iPhone's iOS generation owns the DNS mode.
+
+    A stale client override or a device swap (iOS 26 <-> 27) is corrected here
+    instead of returning 409: the running listener is hot-switched, so the
+    user never has to stop a service or restart the connector by hand.
+    """
+    if major is None:
+        return requested
+    expected = 'suppress' if major >= 27 else 'rewrite'
+    if expected != requested:
+        logger.info(f"Hot-switch DNS mode {requested} -> {expected} for iOS {major}")
+    return expected
+
+
+def _channel_running(manager) -> bool:
+    """Read a channel's running flag without assuming a concrete manager type."""
+    reader = getattr(manager, 'status', None)
+    if callable(reader):
+        try:
+            return bool(reader().get('running'))
+        except Exception:
+            pass
+    return bool(getattr(manager, 'running', False))
+
+
+async def _release_conflicting_channels_locked(*keep: str):
+    """Release enhanced channels that cannot coexist with `keep`.
+
+    Caller must hold enhanced_location_lock. Hot-switching between standard
+    and enhanced location (and between iOS generations) is performed by the
+    connector itself; no manual stop/restart is ever required.
+    """
+    global _dns_target_udid, _wloc_target_udid, _accessory_target_udid
+    global _enhanced_location_target_udid
+    retained = set(keep)
+    if 'wloc' not in retained and _channel_running(wloc_manager):
+        await wloc_manager.stop()
+        _wloc_target_udid = None
+        logger.info("Hot-switch: released wloc channel")
+    if 'accessory' not in retained and _channel_running(accessory_manager):
+        await accessory_manager.stop()
+        _accessory_target_udid = None
+        logger.info("Hot-switch: released accessory channel")
+    if 'dns' not in retained and _channel_running(dns_manager):
+        await dns_manager.stop()
+        _dns_target_udid = None
+        logger.info("Hot-switch: released DNS channel")
+    if not (_channel_running(dns_manager)
+            or _channel_running(wloc_manager)
+            or _channel_running(accessory_manager)):
+        _enhanced_location_target_udid = None
+
+
 @app.post("/api/location/accessory/start")
 async def accessory_location_start(req: AccessoryStartRequest):
     ok, reason = await cloud_authorizer.ensure_authorized_async(req.udid or "")
@@ -544,18 +604,21 @@ async def accessory_location_start(req: AccessoryStartRequest):
             raise AccessoryLocationError(
                 f"iOS {major} 请使用标准 DNS/WLOC 定位；配件通道用于 iOS 27 及以上")
         async with enhanced_location_lock:
-            if (wloc_manager.status()["running"]
-                    or (dns_manager.running and dns_manager.mode != "suppress")):
-                raise AccessoryLocationError("Stop wloc/DNS rewrite before starting accessory location")
+            # DNS rewrite -> suppress is a hot switch: keep port 53 alive so the
+            # phone never loses DNS while moving from iOS 26 to iOS 27.
+            await _release_conflicting_channels_locked('accessory', 'dns')
             # Prepare the companion before sending coordinates. A failed listener
             # must not be reported as a successfully started combined session.
             started_dns = not dns_manager.running
+            previous_mode = dns_manager.mode if not started_dns else None
             try:
                 # Activates a listener the user already prepared instead of
                 # skipping policy setup just because port 53 is bound.
                 await dns_manager.start(req.latitude, req.longitude, mode='suppress')
                 if started_dns:
                     logger.info("Automatically started DNS suppression companion service for accessory location")
+                else:
+                    logger.info(f"Hot-switched DNS companion {previous_mode} -> suppress without restarting")
             except Exception as dns_err:
                 logger.error(f"Failed to start DNS companion: {dns_err}")
                 raise HTTPException(status_code=500, detail=
@@ -570,6 +633,9 @@ async def accessory_location_start(req: AccessoryStartRequest):
             except BaseException:
                 if started_dns:
                     await dns_manager.stop()
+                elif previous_mode and previous_mode != dns_manager.mode:
+                    # Restore the previous generation's channel; keep forwarding.
+                    await dns_manager.prepare(mode=previous_mode)
                 else:
                     # The user may already point phone DNS here; keep forwarding.
                     await dns_manager.deactivate()
@@ -661,10 +727,9 @@ async def wloc_location_start(req: SimulateLocationRequest):
     if not ok:
         raise HTTPException(status_code=403, detail=reason)
     async with enhanced_location_lock:
-        if (accessory_manager.status()["running"] or wloc_manager.status()["running"]
-                or dns_manager.running):
-            raise HTTPException(status_code=409, detail="Stop the active enhanced location channel first")
+        await _release_conflicting_channels_locked('wloc')
         try:
+            # WlocProxy.start() retargets an already running session in place.
             res = await wloc_manager.start(req.latitude, req.longitude)
             global _wloc_target_udid, _enhanced_location_target_udid
             _wloc_target_udid = req.udid
@@ -703,21 +768,15 @@ async def dns_location_prepare(req: DnsPrepareRequest):
     if not ok:
         raise HTTPException(status_code=403, detail=reason)
     major = await _selected_ios_major(req.udid)
-    if major is not None:
-        if major >= 27 and req.mode == 'rewrite':
-            raise HTTPException(status_code=409, detail=
-                                "iOS 27 及以上请使用配件定位和 DNS 抑制")
-        if major < 27 and req.mode == 'suppress':
-            raise HTTPException(status_code=409, detail=
-                                "iOS 26 及以下请使用 DNS/WLOC 改写定位")
-    if req.mode == 'rewrite' and accessory_manager.status()["running"]:
-        raise HTTPException(status_code=409, detail="Stop the active enhanced location channel first")
-    try:
-        if req.mode == 'rewrite':
-            await wloc_manager.prepare()
-        return await dns_manager.prepare(mode=req.mode)
-    except DnsLocationError as error:
-        raise HTTPException(status_code=409, detail=str(error))
+    mode = _dns_mode_for_ios(major, req.mode)
+    async with enhanced_location_lock:
+        await _release_conflicting_channels_locked('dns')
+        try:
+            if mode == 'rewrite':
+                await wloc_manager.prepare()
+            return await dns_manager.prepare(mode=mode)
+        except DnsLocationError as error:
+            raise HTTPException(status_code=409, detail=str(error))
 
 
 @app.post("/api/location/dns/start")
@@ -726,31 +785,25 @@ async def dns_location_start(req: DnsLocationRequest):
     if not ok:
         raise HTTPException(status_code=403, detail=reason)
     major = await _selected_ios_major(req.udid)
-    if major is not None:
-        if major >= 27 and req.mode == 'rewrite':
-            raise HTTPException(status_code=409, detail=
-                                "iOS 27 及以上请使用配件定位和 DNS 抑制")
-        if major < 27 and req.mode == 'suppress':
-            raise HTTPException(status_code=409, detail=
-                                "iOS 26 及以下请使用 DNS/WLOC 改写定位")
+    mode = _dns_mode_for_ios(major, req.mode)
     async with enhanced_location_lock:
-        if ((req.mode == 'rewrite' and accessory_manager.status()["running"])
-                or wloc_manager.status()["running"]):
-            raise HTTPException(status_code=409, detail="Stop the active enhanced location channel first")
+        # Conflicting channels are released here; a running DNS listener is
+        # kept and hot-switched to the requested mode (iOS 26 <-> 27).
+        await _release_conflicting_channels_locked('dns')
         try:
             # Combined setup can request DNS after accessory/start has already
             # prepared it. Reuse that exact companion without resetting counters.
-            if (req.mode == 'suppress' and dns_manager.running
+            if (mode == 'suppress' and dns_manager.running
                     and dns_manager.mode == 'suppress'):
                 current = dns_manager.status()
                 if current.get('target') == dict(latitude=req.latitude,
                                                   longitude=req.longitude):
                     return current
-            if req.mode == 'rewrite':
+            if mode == 'rewrite':
                 # Prepare the public certificate download listener for the phone.
                 # Suppression must never require or generate a CA.
                 await wloc_manager.prepare()
-            res = await dns_manager.start(req.latitude, req.longitude, mode=req.mode)
+            res = await dns_manager.start(req.latitude, req.longitude, mode=mode)
             global _dns_target_udid, _enhanced_location_target_udid
             _dns_target_udid = req.udid
             _enhanced_location_target_udid = req.udid

@@ -376,6 +376,13 @@ class CoreDeviceLocationManager:
                         state_str = "connected" if conn_state else "unknown"
 
                     dev_mode = None
+                    # remotepairingd 的 native browse 记录并不带 osVersion /
+                    # ProductVersion 顶层字段；系统版本藏在 deviceKVSData 的
+                    # 根字典（pymobiledevice3 解析后键为 "NULL"，部分版本为
+                    # None）里。Wi-Fi / CoreDevice 设备不会进入下面的 usbmux
+                    # lockdown 探测，若不在这里取版本，ios_version 会恒为
+                    # null，前端「iOS 版本识别」永远停在 unknown。
+                    ios_version = r.get("osVersion") or r.get("ProductVersion") or None
                     kvs = r.get("deviceKVSData")
                     if kvs:
                         try:
@@ -384,6 +391,12 @@ class CoreDeviceLocationManager:
                             amfi = parsed_kvs.get("com.apple.security.mac.amfi", {})
                             if "DeveloperModeStatus" in amfi:
                                 dev_mode = bool(amfi["DeveloperModeStatus"])
+                            if not ios_version:
+                                root = parsed_kvs.get("NULL") or parsed_kvs.get(None) or {}
+                                if isinstance(root, dict):
+                                    candidate = root.get("ProductVersion") or root.get("osVersion")
+                                    if candidate:
+                                        ios_version = str(candidate)
                         except Exception as kvs_e:
                             logger.debug(f"Failed to parse deviceKVSData for {udid}: {kvs_e}")
 
@@ -396,7 +409,7 @@ class CoreDeviceLocationManager:
                         "model": friendly_model,
                         "raw_model": raw_model,
                         "ecid": r.get("ecid"),
-                        "ios_version": r.get("osVersion") or r.get("ProductVersion"),
+                        "ios_version": ios_version,
                         "auth_state": r.get("authState", {}).get("rawCase", "authenticated"),
                         "connection_type": "Wi-Fi" if is_wireless else "USB",
                         "is_coredevice": True,
@@ -487,7 +500,10 @@ class CoreDeviceLocationManager:
                 for entry in probed:
                     existing = next((item for item in devices if item["udid"] == entry["udid"]), None)
                     if existing is not None:
-                        existing["ios_version"] = entry.get("ios_version")
+                        # lockdown 探测失败时返回 None，不能用它盖掉 native
+                        # browse 已经从 KVS 读到的真实版本。
+                        if entry.get("ios_version"):
+                            existing["ios_version"] = entry["ios_version"]
                     else:
                         devices.append(entry)
         except Exception as e:

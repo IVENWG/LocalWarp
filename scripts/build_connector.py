@@ -26,6 +26,10 @@ OUTPUT_DIR = os.path.abspath(
     )
 )
 PYINSTALLER_VERSION = "6.22.3"
+# 本地构建的默认版本号。必须与 src/backend/server.py 的 VERSION fallback、
+# src/frontend/src/localwarp/connector-release.ts 的 LATEST_CONNECTOR_VERSION
+# 以及 IVENWG/LocalWarp 最新 Release tag 保持一致。
+DEFAULT_CONNECTOR_VERSION = "1.4.2"
 PINNED_CONNECTOR_DEPENDENCIES = {
     "pymobiledevice3": "11.36.0",
     "pytun-pmd3": "3.0.3",
@@ -157,19 +161,23 @@ def build():
         "--hidden-import=pytun_pmd3",
     ])
 
-    # CI 打 tag 构建时注入发布版本（LOCALWARP_BUILD_VERSION）。
-    # 生成到 build/ 下的独立目录并加入 --paths，不改动源码树里的 server.py。
+    # 发布版本注入：CI 打 tag 时用 LOCALWARP_BUILD_VERSION；本地构建用
+    # DEFAULT_CONNECTOR_VERSION。每次都重写 _version.py 并加入 --paths，
+    # 避免 build/ 目录里残留的旧版本戳（例如 1.3.0）被误打进二进制，
+    # 也让「线上 tag / server.py fallback / 前端 LATEST」三者始终一致。
     # 必须放在 cmd 构建完成之后 append：放在之前会因 cmd 未定义直接 NameError，
     # 且后面的整体赋值也会覆盖掉已 append 的参数。
-    build_version = os.environ.get("LOCALWARP_BUILD_VERSION", "").strip()
-    if build_version:
-        version_root = BUILD_ROOT or os.path.join(ROOT_DIR, "build")
-        version_dir = os.path.join(version_root, "version_stamp")
-        os.makedirs(version_dir, exist_ok=True)
-        with open(os.path.join(version_dir, "_version.py"), "w", encoding="utf-8") as f:
-            f.write(f'# 由 CI 注入的发布版本（build_connector.py 生成）\nVERSION = {build_version!r}\n')
-        cmd.append(f"--paths={version_dir}")
-        print(f"[+] Injected release version: {build_version}")
+    build_version = (
+        os.environ.get("LOCALWARP_BUILD_VERSION", "").strip()
+        or DEFAULT_CONNECTOR_VERSION
+    )
+    version_root = BUILD_ROOT or os.path.join(ROOT_DIR, "build")
+    version_dir = os.path.join(version_root, "version_stamp")
+    os.makedirs(version_dir, exist_ok=True)
+    with open(os.path.join(version_dir, "_version.py"), "w", encoding="utf-8") as f:
+        f.write(f'# 由 build_connector.py 生成，需与 server.py fallback 保持一致\nVERSION = {build_version!r}\n')
+    cmd.append(f"--paths={version_dir}")
+    print(f"[+] Injected release version: {build_version}")
 
     # Dynamic safe metadata injection for DDI / Cryptex tools
     import importlib.metadata
