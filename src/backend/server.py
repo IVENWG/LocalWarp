@@ -88,7 +88,7 @@ try:
     # CI 打 tag 构建时由 build_connector.py 注入（build/version_stamp/_version.py）
     from _version import VERSION  # type: ignore[import-not-found]
 except Exception:
-    VERSION = "1.4.2"
+    VERSION = "1.4.3"
 
 # 云端权益授权：v1.1.0 起定位写入需要在线授权（短期内存缓存）
 from connector_auth import CloudAuthorizer, authorizer as cloud_authorizer

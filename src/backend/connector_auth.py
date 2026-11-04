@@ -50,10 +50,14 @@ MAX_PAIRED_UDIDS = 64
 _MAX_CACHE_ENTRIES = 256
 
 # Ed25519 验证公钥配置（连接器仅持公钥，私钥留在云端，零数据库查密钥）
-# 轮换为 v2，废弃已在旧源码中出现过的 v1 密钥与公钥
+# 轮换为 v2，废弃已在旧源码中出现过的 v1 密钥与公钥。
+# 这把公钥必须与生产 Worker 的 WORKER_AUTH_PRIVATE_KEY 成对；云端轮换密钥时
+# 必须同步此处并发布新版本连接器，否则所有新装用户都会因签名校验失败而无法
+# 配对（/api/auth/configure -> invalid lease token: signature verification failed）。
+# 可用 WORKER_AUTH_PUBLIC_KEY 环境变量覆盖，便于灰度验证与密钥平滑轮换。
 AUTH_KID = "lw-ed25519-v2"
 DEFAULT_PUBLIC_KEY_HEX = os.getenv("WORKER_AUTH_PUBLIC_KEY") or (
-    "523c70f14ee0bed30f478543450c56b3fb93b0d30236040d50cf09bd027b33dd"
+    "f40746051bac523970ed6dbc559eac153a2b8b8f2197df4eab96b1ae6849c187"
 )
 
 _default_authorizer: Optional["CloudAuthorizer"] = None
