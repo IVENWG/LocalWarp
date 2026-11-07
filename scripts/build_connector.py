@@ -29,7 +29,7 @@ PYINSTALLER_VERSION = "6.22.3"
 # 本地构建的默认版本号。必须与 src/backend/server.py 的 VERSION fallback、
 # src/frontend/src/localwarp/connector-release.ts 的 LATEST_CONNECTOR_VERSION
 # 以及 IVENWG/LocalWarp 最新 Release tag 保持一致。
-DEFAULT_CONNECTOR_VERSION = "1.4.3"
+DEFAULT_CONNECTOR_VERSION = "1.5.0"
 PINNED_CONNECTOR_DEPENDENCIES = {
     "pymobiledevice3": "11.36.0",
     "pytun-pmd3": "3.0.3",

@@ -168,6 +168,11 @@ class AccessoryLocationManager:
         self._guard_task: Optional[asyncio.Task] = None
         self._lock = asyncio.Lock()
 
+    @property
+    def session_task(self) -> Optional[asyncio.Task]:
+        """Current session identity, used to scope companion-service cleanup."""
+        return self._task
+
     def _check_auth(self, serial: Optional[str]) -> bool:
         if self._auth_guard is None:
             return True

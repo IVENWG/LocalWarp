@@ -1,7 +1,10 @@
 """连接器内置的 DNS 劫持定位通道（软件模拟定位，零手机侧安装）。
 
-真机实测结论（2026-10-25，iPhone 14 Pro Max / iOS 26.6.1，详见
-docs/research/enhanced-location-acceptance-2026-10-25.md 第四轮）：
+当前状态（2026-11）：Apple 更新证书校验后，用户 CA 终结 TLS 的 rewrite 路线
+在所有 iOS 版本均被阻断，仅保留为手动旧选项；全版本默认通道是「USB 配件 +
+DNS 抑制」（suppress）。以下为 rewrite 的历史真机实测结论（2026-10-25，
+iPhone 14 Pro Max / iOS 26.6.1，详见
+docs/research/enhanced-location-acceptance-2026-10-25.md 第四轮），不代表当前可用：
 
 - iOS 的系统定位进程 locationd 不查阅 Wi-Fi 手动/PAC 代理设置，但使用系统
   解析器；把手机 Wi-Fi 的 DNS 指向连接器后，两个 Apple 定位域名的查询会被
@@ -72,16 +75,25 @@ FALLBACK_UPSTREAMS = ('223.5.5.5', '119.29.29.29')
 
 def constraint_text(mode='rewrite'):
     if mode == 'suppress':
-        return ('Start the USB accessory session, set Wi-Fi DNS to this computer, '
-                'enable Airplane Mode with Wi-Fi on, then toggle Location Services once. '
-                'Verify DNS queries and suppression counters. Cached references and GNSS can still '
-                'reject accessory fixes; far-distance adoption is not guaranteed. '
+        return ('Observed operating conditions on real-device sessions (not a '
+                'guarantee for every device or iOS build): far-distance targets '
+                'sometimes required Airplane Mode on with Wi-Fi turned back on, '
+                'Wi-Fi DNS pointed at this computer (DNS suppression), and one '
+                'Location Services off/on toggle. These steps are phone-side '
+                'actions the user must perform and confirm; the Connector cannot '
+                'observe or prove that iOS adopted the coordinates. Verify the '
+                'DNS query/suppression counters and accessory ACKs, but only the '
+                'blue dot in Maps confirms the phone position. '
+                'Cached references and GNSS can still reject accessory fixes. '
                 'Restore DNS to Automatic and disable Airplane Mode when finished.')
     return ('Set the phone Wi-Fi DNS to this computer, trust the LocalWarp CA, '
-            'then toggle Location Services once. Verified on iOS 26.6.1: the '
-            'blue dot adopts the target after a 2-6 minute learning window of '
-            'consistent answers and stays (cached, zero further queries); '
-            'no airplane mode needed. Restore DNS to Automatic to revert. '
+            'then toggle Location Services once. Apple certificate validation '
+            'now blocks this user-CA DNS rewrite route on current iOS versions; '
+            'it is retained only as a legacy manual option. Installing and '
+            'fully trusting the CA is not a promise that DNS rewrite works. '
+            'TLS errors, timeouts, zero TLS handshakes or zero WLOC requests are '
+            'anomalies, not proof of a new system certificate rule. '
+            'Restore DNS to Automatic to revert. '
             'Ports 53/443 need elevation on macOS; not on Windows.')
 
 
@@ -875,7 +887,16 @@ class DnsLocationManager:
                              for u in self.upstream_mgr.get_ordered_upstreams()]
         return dict(running=self.running, active=self.active, mode=self.mode, sinkhole_ip=self.sinkhole,
                     tls_listening=self.server is not None, requires_ca=self.mode == 'rewrite',
-                    ios27_hint='iOS >=27: accessory + DNS suppression is experimental; verify NMEA screening, IntegrityMonitor and the map during an active session.',
+                    # Keep the historical key for older workbench builds while
+                    # replacing its iOS-27-only claim with version-neutral text.
+                    ios27_hint=('Explicit mode selection is respected on every iOS version. '
+                                'The USB accessory + DNS suppression combination is experimental; '
+                                'airplane mode, Wi-Fi DNS pointing here and a Location Services '
+                                'toggle were observed as operating conditions on test devices, '
+                                'not guarantees. ACKs and DNS counters never prove the phone '
+                                'adopted the coordinates.'),
+                    mode_hint=('Explicit mode selection is respected on every iOS version; '
+                               'evidence of phone adoption requires user confirmation in Maps.'),
                     listen_dns_port=self.dns_port,
                     listen_tls_port=self.tls_port, lan_ip=self.lan_ip,
                     hijack_hosts=sorted(HIJACK_HOSTS),

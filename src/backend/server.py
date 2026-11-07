@@ -88,7 +88,12 @@ try:
     # CI 打 tag 构建时由 build_connector.py 注入（build/version_stamp/_version.py）
     from _version import VERSION  # type: ignore[import-not-found]
 except Exception:
-    VERSION = "1.4.3"
+    VERSION = "1.5.0"
+
+# 能力协商标志：本版连接器尊重工作台显式选择的 DNS 模式（不再按 iOS 主版本覆盖），
+# 并允许 iOS 26 使用「USB 配件定位 + DNS 抑制」组合方案。旧连接器不声明该能力，
+# 新工作台据此给出准确的升级提示，且不会把组合方案误报为已启动。
+CAPABILITY_IOS26_COMBINED = "ios26-combined-location"
 
 # 云端权益授权：v1.1.0 起定位写入需要在线授权（短期内存缓存）
 from connector_auth import CloudAuthorizer, authorizer as cloud_authorizer
@@ -254,6 +259,7 @@ dns_manager = DnsLocationManager(
     auth_guard=_server_dns_auth_guard)
 logger.info(f"Initialized DNS Location Manager with upstreams: {dns_manager.upstreams}")
 enhanced_location_lock = asyncio.Lock()
+_accessory_watchers = set()
 
 
 @app.on_event("shutdown")
@@ -287,12 +293,12 @@ class SimulateLocationRequest(BaseModel):
 
 
 class DnsLocationRequest(SimulateLocationRequest):
-    mode: Literal['rewrite', 'suppress'] = 'rewrite'
+    mode: Literal['rewrite', 'suppress'] = 'suppress'
 
 
 class DnsPrepareRequest(BaseModel):
     udid: Optional[str] = Field(None, description="Device UDID for version authorization")
-    mode: Literal['rewrite', 'suppress'] = 'rewrite'
+    mode: Literal['rewrite', 'suppress'] = 'suppress'
 
 
 class ClearLocationRequest(BaseModel):
@@ -368,7 +374,7 @@ class ConnectorAuthConfigureRequest(BaseModel):
 @app.get("/api/health")
 async def health_check():
     caps = ["cloud-auth", "cloud-auth-v2", "multi-device", "accessory-location", "wloc-proxy",
-            "dns-location"]
+            "dns-location", CAPABILITY_IOS26_COMBINED]
     return {
         "status": "healthy",
         "service": "LocalWarp Connector",
@@ -536,18 +542,13 @@ async def _selected_ios_major(udid: Optional[str]) -> Optional[int]:
 
 
 def _dns_mode_for_ios(major: Optional[int], requested: str) -> str:
-    """The selected iPhone's iOS generation owns the DNS mode.
-
-    A stale client override or a device swap (iOS 26 <-> 27) is corrected here
-    instead of returning 409: the running listener is hot-switched, so the
-    user never has to stop a service or restart the connector by hand.
-    """
-    if major is None:
-        return requested
-    expected = 'suppress' if major >= 27 else 'rewrite'
-    if expected != requested:
-        logger.info(f"Hot-switch DNS mode {requested} -> {expected} for iOS {major}")
-    return expected
+    """Respect explicit legacy choices; default to suppression on every iOS version."""
+    if requested not in ('rewrite', 'suppress'):
+        logger.info(f"Unknown DNS mode {requested!r}; falling back to suppress")
+        return 'suppress'
+    if major is not None:
+        logger.info(f"Honouring explicit DNS mode {requested} for iOS {major}")
+    return requested
 
 
 def _channel_running(manager) -> bool:
@@ -589,24 +590,76 @@ async def _release_conflicting_channels_locked(*keep: str):
         _enhanced_location_target_udid = None
 
 
+async def _rollback_dns_companion(started_dns: bool, previous_mode) -> None:
+    """Undo the companion setup after a failed combined start.
+
+    A newly bound listener is stopped completely. A listener that was already
+    serving the phone keeps its ports but returns to its previous policy (or is
+    deactivated) so it never claims a target without an accessory session.
+    """
+    try:
+        if started_dns:
+            await dns_manager.stop()
+        else:
+            if previous_mode and previous_mode != dns_manager.mode:
+                await dns_manager.prepare(mode=previous_mode)
+            # A failed start must not leave the attempted target active on a
+            # listener the phone may still be using as its DNS server.
+            await dns_manager.deactivate()
+    except Exception as error:
+        logger.warning(f"Failed to roll back DNS companion: {error}")
+
+
+async def _watch_accessory_session(session_manager, session_task, udid):
+    """Deactivate the matching companion when its asynchronous session ends."""
+    global _dns_target_udid, _accessory_target_udid, _enhanced_location_target_udid
+    try:
+        try:
+            await asyncio.shield(session_task)
+        except (asyncio.CancelledError, Exception):
+            pass
+        async with enhanced_location_lock:
+            # A delayed completion must never clean up a replacement session.
+            if (accessory_manager is not session_manager
+                    or session_manager.session_task is not session_task
+                    or _accessory_target_udid != udid):
+                return
+            await session_manager.stop()
+            if _dns_target_udid == udid and dns_manager.mode == 'suppress':
+                # Keep forwarding DNS while the user restores phone settings.
+                await dns_manager.deactivate()
+                _dns_target_udid = None
+            _accessory_target_udid = None
+            if _dns_target_udid is None and _wloc_target_udid is None:
+                _enhanced_location_target_udid = None
+    except Exception as error:
+        logger.error(f"Failed to clean up ended accessory session: {error}")
+
+
 @app.post("/api/location/accessory/start")
 async def accessory_location_start(req: AccessoryStartRequest):
     ok, reason = await cloud_authorizer.ensure_authorized_async(req.udid or "")
     if not ok:
         logger.warning(f"Accessory start denied by cloud authorization: {reason}")
         raise HTTPException(status_code=403, detail=reason)
+    global _dns_target_udid, _accessory_target_udid, _enhanced_location_target_udid
     try:
+        major = await _selected_ios_major(req.udid)
         logger.info(
             f"Accessory location start: lat={req.latitude}, lon={req.longitude}, "
-            f"udid={req.udid}, interval={req.interval}")
-        major = await _selected_ios_major(req.udid)
-        if major is not None and major < 27:
-            raise AccessoryLocationError(
-                f"iOS {major} 请使用标准 DNS/WLOC 定位；配件通道用于 iOS 27 及以上")
+            f"udid={req.udid}, interval={req.interval}, ios_major={major}")
+        # No iOS-generation gate: the accessory + DNS suppression combination is
+        # available on iOS 26 as well. The version above is diagnostic only.
         async with enhanced_location_lock:
             # DNS rewrite -> suppress is a hot switch: keep port 53 alive so the
-            # phone never loses DNS while moving from iOS 26 to iOS 27.
+            # phone never loses DNS when changing channel or iOS generation.
             await _release_conflicting_channels_locked('accessory', 'dns')
+
+            retargeting = _channel_running(accessory_manager)
+            if retargeting and (not req.udid or req.udid != _accessory_target_udid):
+                raise HTTPException(status_code=409, detail=
+                                    "Stop the current accessory session before changing devices")
+
             # Prepare the companion before sending coordinates. A failed listener
             # must not be reported as a successfully started combined session.
             started_dns = not dns_manager.running
@@ -621,24 +674,37 @@ async def accessory_location_start(req: AccessoryStartRequest):
                     logger.info(f"Hot-switched DNS companion {previous_mode} -> suppress without restarting")
             except Exception as dns_err:
                 logger.error(f"Failed to start DNS companion: {dns_err}")
+                if retargeting:
+                    await accessory_manager.stop()
+                    _accessory_target_udid = None
+                    _enhanced_location_target_udid = None
+                await _rollback_dns_companion(started_dns, previous_mode)
                 raise HTTPException(status_code=500, detail=
-                                    "Could not start DNS suppression; accessory session was not started") from dns_err
+                                    "Could not start DNS suppression; accessory session is stopped") from dns_err
             try:
-                status = await accessory_manager.start(
-                    req.latitude, req.longitude,
-                    serial=req.udid, interval=req.interval)
-                global _accessory_target_udid, _enhanced_location_target_udid
+                if retargeting:
+                    status = await accessory_manager.update(req.latitude, req.longitude)
+                else:
+                    status = await accessory_manager.start(
+                        req.latitude, req.longitude,
+                        serial=req.udid, interval=req.interval)
+                _dns_target_udid = req.udid
                 _accessory_target_udid = req.udid
                 _enhanced_location_target_udid = req.udid
+                if not retargeting:
+                    session_task = getattr(accessory_manager, 'session_task', None)
+                    if session_task is not None:
+                        watcher = asyncio.create_task(_watch_accessory_session(
+                            accessory_manager, session_task, req.udid))
+                        _accessory_watchers.add(watcher)
+                        watcher.add_done_callback(_accessory_watchers.discard)
             except BaseException:
-                if started_dns:
-                    await dns_manager.stop()
-                elif previous_mode and previous_mode != dns_manager.mode:
-                    # Restore the previous generation's channel; keep forwarding.
-                    await dns_manager.prepare(mode=previous_mode)
-                else:
-                    # The user may already point phone DNS here; keep forwarding.
-                    await dns_manager.deactivate()
+                try:
+                    await accessory_manager.stop()
+                finally:
+                    _accessory_target_udid = None
+                    _enhanced_location_target_udid = None
+                    await _rollback_dns_companion(started_dns, previous_mode)
                 raise
         return {"success": True, "message": "Accessory location session started", "data": status}
     except HTTPException:
@@ -654,17 +720,22 @@ async def accessory_location_start(req: AccessoryStartRequest):
 
 @app.post("/api/location/accessory/update")
 async def accessory_location_update(req: AccessoryUpdateRequest):
-    # 会话在 start 时已通过权益门禁。update 携带 udid 时再复核一次权益；
-    # 未携带时不再向云端要授权（空 udid 会被云端以 missing target device
-    # 拒绝），会话存在性由 manager.update 校验（无会话返回 409）
-    if req.udid:
-        ok, reason = await cloud_authorizer.ensure_authorized_async(req.udid)
-        if not ok:
-            logger.warning(f"Accessory update denied by cloud authorization: {reason}")
-            raise HTTPException(status_code=403, detail=reason)
+    # Legacy clients omit UDID. Bind them to the current owner before awaiting
+    # authorization, then recheck that identity under the lifecycle lock.
+    target_udid = req.udid or _accessory_target_udid
+    if not target_udid:
+        raise HTTPException(status_code=409, detail="No owned accessory session")
+    ok, reason = await cloud_authorizer.ensure_authorized_async(target_udid)
+    if not ok:
+        raise HTTPException(status_code=403, detail=reason)
     try:
-        status = await accessory_manager.update(req.latitude, req.longitude)
+        async with enhanced_location_lock:
+            if target_udid != _accessory_target_udid:
+                raise HTTPException(status_code=409, detail="Accessory session belongs to another device")
+            status = await accessory_manager.update(req.latitude, req.longitude)
         return {"success": True, "message": "Accessory location target updated", "data": status}
+    except HTTPException:
+        raise
     except AccessoryLocationError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
@@ -676,19 +747,17 @@ async def accessory_location_update(req: AccessoryUpdateRequest):
 
 @app.post("/api/location/accessory/stop")
 async def accessory_location_stop():
-    global _accessory_target_udid, _enhanced_location_target_udid
-    _accessory_target_udid = None
-    if _dns_target_udid is None and _wloc_target_udid is None:
-        _enhanced_location_target_udid = None
+    global _dns_target_udid, _accessory_target_udid, _enhanced_location_target_udid
     try:
         async with enhanced_location_lock:
             status = await accessory_manager.stop()
+            _accessory_target_udid = None
             if dns_manager.running and dns_manager.mode == 'suppress':
-                try:
-                    await dns_manager.stop()
-                    logger.info("Automatically stopped DNS suppression companion service")
-                except Exception as dns_err:
-                    logger.warning(f"Failed to auto-stop DNS companion: {dns_err}")
+                await dns_manager.stop()
+                _dns_target_udid = None
+                logger.info("Automatically stopped DNS suppression companion service")
+            if _dns_target_udid is None and _wloc_target_udid is None:
+                _enhanced_location_target_udid = None
         return {"success": True, "message": "Accessory location session stopped", "data": status}
     except Exception as e:
         logger.error(f"Failed to stop accessory location session: {e}")
@@ -867,6 +936,8 @@ async def wloc_ca_download():
 @app.post("/api/device/disconnect")
 @app.post("/api/device/{udid}/disconnect")
 async def disconnect_device(req: Optional[DisconnectDeviceRequest] = None, udid: Optional[str] = None):
+    global _dns_target_udid, _wloc_target_udid, _accessory_target_udid
+    global _enhanced_location_target_udid
     target_udid = (req.udid if req else None) or udid
     should_restore = req.restore_location if req is not None else True
     logger.info(f"Received disconnect request for udid={target_udid}, restore_location={should_restore}")
@@ -879,6 +950,20 @@ async def disconnect_device(req: Optional[DisconnectDeviceRequest] = None, udid:
             except Exception as clr_e:
                 logger.warning(f"Could not restore location before disconnect: {clr_e}")
         await manager.disconnect_device(device_id=target_udid or "")
+        # A disconnected iPhone must not leave a USB accessory session or a DNS
+        # suppression listener quietly serving stale coordinates. Only release
+        # the enhanced channels when this exact device owns them; a combined
+        # session for another phone stays untouched. Stop is idempotent, so a
+        # retry after a failed disconnect cannot leave half of the pair running.
+        async with enhanced_location_lock:
+            if target_udid and target_udid in {
+                    _dns_target_udid, _wloc_target_udid, _accessory_target_udid}:
+                await _release_conflicting_channels_locked()
+                _dns_target_udid = None
+                _wloc_target_udid = None
+                _accessory_target_udid = None
+                _enhanced_location_target_udid = None
+                logger.info("Released enhanced channels owned by disconnected device")
         return {
             "success": True,
             "message": "iPhone 连接已成功释放",
