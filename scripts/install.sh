@@ -94,10 +94,10 @@ DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/${BINARY_ASSET
 # diverge (for example right after tagging a new Connector version).
 # BEGIN PINNED CHECKSUMS
 case "${BINARY_ASSET}" in
-    LocalWarp-Connector-macos-arm64)       PINNED_SHA256="7070d3c58cb5ea3f9cfb43255c5b1e92dd747473a05a7b8bac480afa098db727" ;;
-    LocalWarp-Connector-macos-x64)         PINNED_SHA256="8f050d7e976c90053f60507206c4e6b29dfe838811b1e3e1047fd67252077f6c" ;;
-    LocalWarp-Connector-linux-x64)         PINNED_SHA256="aa09ca4af50be3df549a17e82e3e55c0accc48b7f6514f159075159af53974aa" ;;
-    LocalWarp-Connector-windows-x64.exe)   PINNED_SHA256="847678f7755be4be067b376c6fb23c84b5fc6c162d107ba2d099493a04a0e67a" ;;
+    LocalWarp-Connector-macos-arm64)       PINNED_SHA256="f6af3a8318a550f9a3a35e2de8150460db75163ef52f0832e77661ca9d395d42" ;;
+    LocalWarp-Connector-macos-x64)         PINNED_SHA256="65d5ccacd29473cdcaffc1ab5ced8e9e8b526fa521684a254ad07543c2e78812" ;;
+    LocalWarp-Connector-linux-x64)         PINNED_SHA256="d226581792c94bd5aa11e9ed2e29eefaec646d71bb871f86c1f406b8eff469ce" ;;
+    LocalWarp-Connector-windows-x64.exe)   PINNED_SHA256="a3c7a3440eb25724baecac0793715008723eee2f2a508cea3ffc67f503765b97" ;;
     *)                                     PINNED_SHA256="" ;;
 esac
 # END PINNED CHECKSUMS
