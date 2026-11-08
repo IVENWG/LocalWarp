@@ -88,7 +88,7 @@ try:
     # CI 打 tag 构建时由 build_connector.py 注入（build/version_stamp/_version.py）
     from _version import VERSION  # type: ignore[import-not-found]
 except Exception:
-    VERSION = "1.5.0"
+    VERSION = "1.5.1"
 
 # 能力协商标志：本版连接器尊重工作台显式选择的 DNS 模式（不再按 iOS 主版本覆盖），
 # 并允许 iOS 26 使用「USB 配件定位 + DNS 抑制」组合方案。旧连接器不声明该能力，
@@ -541,6 +541,40 @@ async def _selected_ios_major(udid: Optional[str]) -> Optional[int]:
         return None
 
 
+ACCESSORY_USB_PREFLIGHT_DETAIL = (
+    "No USB-connected iPhone matches the selected device. Connect this iPhone "
+    "with a data cable, unlock it, and retry enhanced location."
+)
+
+
+async def _ensure_usb_accessory_device(udid: Optional[str]) -> None:
+    """Reject a session whose *selected* device is explicitly not on USB.
+
+    The iAP2 runner is started in a background task, so a Wi-Fi-only phone
+    silently reselected by the workbench used to be reported as a running
+    session with zero acknowledged packets. Only act on positive evidence:
+    device discovery is best effort, and a phone that is rebooting is simply
+    absent from the list. Guessing from a missing record would block legitimate
+    sessions (and any test environment with real devices attached).
+    """
+    if not udid:
+        return  # legacy clients let the runner pick the first USB device
+    try:
+        devices = await manager.list_devices()
+    except Exception as error:
+        logger.debug(f"USB preflight could not list devices: {error}")
+        return
+    matches = [device for device in devices
+               if device.get('udid') == udid]
+    if not matches:
+        return  # not enumerated yet (reboot/unpaired); let the session diagnose
+    if any(device.get('connection_type') == 'USB'
+           and device.get('online') is not False for device in matches):
+        return
+    if any(device.get('connection_type') is not None for device in matches):
+        raise HTTPException(status_code=409, detail=ACCESSORY_USB_PREFLIGHT_DETAIL)
+
+
 def _dns_mode_for_ios(major: Optional[int], requested: str) -> str:
     """Respect explicit legacy choices; default to suppression on every iOS version."""
     if requested not in ('rewrite', 'suppress'):
@@ -645,6 +679,8 @@ async def accessory_location_start(req: AccessoryStartRequest):
     global _dns_target_udid, _accessory_target_udid, _enhanced_location_target_udid
     try:
         major = await _selected_ios_major(req.udid)
+        # 必须在启动 DNS 伴侣与后台会话之前校验：USB 链路打不开时不能报成功。
+        await _ensure_usb_accessory_device(req.udid)
         logger.info(
             f"Accessory location start: lat={req.latitude}, lon={req.longitude}, "
             f"udid={req.udid}, interval={req.interval}, ios_major={major}")

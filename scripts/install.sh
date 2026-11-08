@@ -84,7 +84,29 @@ echo "[+] Detected: ${PLATFORM} (${MACHINE})"
 
 mkdir -p "${INSTALL_DIR}"
 
-DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/LocalWarp-Connector-${PLATFORM}-${MACHINE}"
+BINARY_ASSET="LocalWarp-Connector-${PLATFORM}-${MACHINE}"
+DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/${BINARY_ASSET}"
+
+# Pinned SHA-256 for every published Connector asset. GitHub Releases are
+# mutable, so verify the downloaded bytes before chmod + registering the login
+# service. Keep this table in sync with the published Release: the deployment
+# gate in scripts/verify-connector-release.ts refuses to deploy when the two
+# diverge (for example right after tagging a new Connector version).
+# BEGIN PINNED CHECKSUMS
+case "${BINARY_ASSET}" in
+    LocalWarp-Connector-macos-arm64)       PINNED_SHA256="7070d3c58cb5ea3f9cfb43255c5b1e92dd747473a05a7b8bac480afa098db727" ;;
+    LocalWarp-Connector-macos-x64)         PINNED_SHA256="8f050d7e976c90053f60507206c4e6b29dfe838811b1e3e1047fd67252077f6c" ;;
+    LocalWarp-Connector-linux-x64)         PINNED_SHA256="aa09ca4af50be3df549a17e82e3e55c0accc48b7f6514f159075159af53974aa" ;;
+    LocalWarp-Connector-windows-x64.exe)   PINNED_SHA256="847678f7755be4be067b376c6fb23c84b5fc6c162d107ba2d099493a04a0e67a" ;;
+    *)                                     PINNED_SHA256="" ;;
+esac
+# END PINNED CHECKSUMS
+
+if [ -n "${LOCALWARP_EXPECTED_SHA256:-}" ]; then
+    EXPECTED_SHA256="${LOCALWARP_EXPECTED_SHA256}"
+else
+    EXPECTED_SHA256="${PINNED_SHA256}"
+fi
 
 # Stage in the destination directory, then rename atomically. Writing directly
 # over a running executable can fail or damage the installed version.
@@ -120,20 +142,31 @@ if [ "${DOWNLOAD_OK}" -eq 0 ]; then
     fi
 fi
 
-if [ -n "${LOCALWARP_EXPECTED_SHA256:-}" ]; then
+if [ "${DOWNLOAD_OK}" -eq 1 ]; then
+    if [ -z "${EXPECTED_SHA256}" ]; then
+        echo "[-] No SHA-256 checksum pinned for ${BINARY_ASSET}. Refusing to install an unverified binary."
+        echo "    Copy a fresh install command from https://localwarp.com/download"
+        exit 1
+    fi
     if command -v shasum >/dev/null 2>&1; then
         ACTUAL_SHA256="$(shasum -a 256 "${STAGED_BINARY}" | awk '{print $1}')"
     elif command -v sha256sum >/dev/null 2>&1; then
         ACTUAL_SHA256="$(sha256sum "${STAGED_BINARY}" | awk '{print $1}')"
     else
-        echo "[-] Neither shasum nor sha256sum available to verify LOCALWARP_EXPECTED_SHA256."
+        echo "[-] Neither shasum nor sha256sum is available; cannot verify the download."
         exit 1
     fi
-    if [ "${ACTUAL_SHA256}" != "${LOCALWARP_EXPECTED_SHA256}" ]; then
-        echo "[-] SHA-256 mismatch! Expected ${LOCALWARP_EXPECTED_SHA256}, got ${ACTUAL_SHA256}"
+    if [ "${ACTUAL_SHA256}" != "${EXPECTED_SHA256}" ]; then
+        echo "[-] SHA-256 mismatch for ${BINARY_ASSET}!"
+        echo "    expected: ${EXPECTED_SHA256}"
+        echo "    actual:   ${ACTUAL_SHA256}"
+        echo "    The published Release may have changed. Copy a fresh install command from"
+        echo "    https://localwarp.com/download, or set LOCALWARP_EXPECTED_SHA256 explicitly."
         exit 1
     fi
-    echo "[+] Verified binary SHA-256: ${ACTUAL_SHA256}"
+    echo "[+] Verified SHA-256: ${ACTUAL_SHA256}"
+else
+    echo "[*] Local build fallback; skipping pinned checksum verification."
 fi
 
 chmod +x "${STAGED_BINARY}"
@@ -177,27 +210,27 @@ EOF
     echo "[+] macOS launchd service configured and started!"
 fi
 
-wait_for_connector_health() {
-    # launchd may take several seconds to spawn the bundled service after bootstrap.
-    # Wait for readiness so a successful install does not immediately print a false
-    # connection error while the service is still starting.
-    command -v curl >/dev/null 2>&1 || return 1
-    for ((attempt = 1; attempt <= 30; attempt++)); do
-        if curl -fs --max-time 1 http://127.0.0.1:28888/health | grep -q '"healthy"'; then
-            return 0
+# Health check
+# The Connector is a single-file PyInstaller binary: a cold start can take
+# ~20s before 127.0.0.1:28888 accepts connections, so poll instead of sleeping
+# a fixed 2s. --noproxy is required on hosts that set HTTP_PROXY, otherwise
+# curl sends the loopback request through the proxy and reports a bogus 502.
+HEALTHY=0
+if command -v curl >/dev/null 2>&1; then
+    for (( attempt = 1; attempt <= 15; attempt++ )); do
+        if curl --noproxy '*' -fsS --max-time 3 \
+            http://127.0.0.1:28888/health 2>/dev/null | grep -q '"healthy"'; then
+            HEALTHY=1
+            break
         fi
-        if [ "${attempt}" -lt 30 ]; then
-            sleep 1
-        fi
+        sleep 2
     done
-    return 1
-}
+fi
 
-if wait_for_connector_health; then
+if [ "${HEALTHY}" -eq 1 ]; then
     echo ""
     echo "=================================================="
     echo "  🎉 LocalWarp Connector is ONLINE!              "
-    echo "  Return to the workbench to continue.           "
     echo "  Listening on: http://127.0.0.1:28888           "
     echo "  Web Studio:   https://localwarp.com/app        "
     echo "  Uninstall:                                     "
@@ -205,7 +238,7 @@ if wait_for_connector_health; then
     echo "=================================================="
 else
     echo ""
-    echo "[!] Connector installed but did not become ready within 30 seconds."
-    echo "[*] Return to the workbench and select Recheck."
-    echo "[*] If it remains offline, inspect /tmp/localwarp-connector.err"
+    echo "[!] Service registered, but the health check did not pass yet."
+    echo "    Check it with: curl --noproxy '*' http://127.0.0.1:28888/health"
+    echo "[*] Logs: /tmp/localwarp-connector.log /tmp/localwarp-connector.err"
 fi
